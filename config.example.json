@@ -1,0 +1,12 @@
+{
+    "bduss": "",
+    "sign_interval": 3,
+    "timeout": 30,
+    "max_retries": 3,
+    "proxy": "",
+    "schedule_enabled": false,
+    "schedule_time": "08:00",
+    "schedule_mode": "onekey",
+    "startup_minimize_to_tray": true,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+.vscode/
+
+config.json
+sign.log
+sign.log.*
+
+build/
+dist/
+installer/out/
