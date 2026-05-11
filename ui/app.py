@@ -1,4 +1,4 @@
-"""百度贴吧自动签到工具 - 图形界面主窗口。"""
+"""百度贴吧自动签到工具 - CustomTkinter 现代风格主窗口。"""
 
 import datetime
 import os
@@ -7,6 +7,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import customtkinter as ctk
 import requests
 
 from core import CONFIG_FILE, DEFAULT_CONFIG, LOG_FILE, load_config, logger, save_config
@@ -22,20 +23,71 @@ from .win_startup import (
 )
 
 WINDOW_TITLE = "百度贴吧自动签到"
-WINDOW_SIZE = "660x780"
+WINDOW_SIZE = "760x880"
+
+LOG_OK = "#22A45D"
+LOG_FAIL = "#E04848"
+LOG_INFO = "#3D8DFF"
 
 
-class App(tk.Tk):
+def _section(parent, title: str, **pack_kw) -> ctk.CTkFrame:
+    """创建带标题的圆角卡片，返回内部内容容器。"""
+    outer = ctk.CTkFrame(parent, corner_radius=10)
+    outer.pack(**pack_kw)
+    ctk.CTkLabel(
+        outer,
+        text=title,
+        anchor="w",
+        font=ctk.CTkFont(size=13, weight="bold"),
+    ).pack(fill="x", padx=12, pady=(8, 2))
+    inner = ctk.CTkFrame(outer, fg_color="transparent")
+    inner.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+    return inner
+
+
+def make_progress_compat(progressbar: ctk.CTkProgressBar) -> "_ProgressCompat":
+    """让 ttk 风格的 progressbar.configure(maximum=N) / __setitem__('value', i)
+    继续工作（worker 仍按旧 API 调用）。"""
+    return _ProgressCompat(progressbar)
+
+
+class _ProgressCompat:
+    """适配 ttk.Progressbar API → CTkProgressBar.set(0..1)。"""
+
+    def __init__(self, bar: ctk.CTkProgressBar):
+        self._bar = bar
+        self._max = 1
+
+    def configure(self, **kw):
+        if "maximum" in kw:
+            self._max = max(1, int(kw["maximum"]))
+            self._bar.set(0)
+        if "value" in kw:
+            self.__setitem__("value", kw["value"])
+
+    def __setitem__(self, key, value):
+        if key == "value":
+            self._bar.set(min(1.0, value / self._max))
+        elif key == "maximum":
+            self._max = max(1, int(value))
+
+
+class App(ctk.CTk):
     def __init__(self, start_minimized: bool = False):
         super().__init__()
         self._start_minimized = start_minimized
+
+        self.config_data = load_config()
+        ctk.set_appearance_mode(self.config_data.get("ui_theme", "system"))
+        ctk.set_default_color_theme(self.config_data.get("ui_color", "blue"))
+
         self.title(WINDOW_TITLE)
         self.resizable(False, False)
         w, h = (int(x) for x in WINDOW_SIZE.split("x"))
         x = (self.winfo_screenwidth() - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
-        self.config_data = load_config()
+
         self._signing = False
         self._show_bduss = False
         self._scheduler_stop = threading.Event()
@@ -43,6 +95,7 @@ class App(tk.Tk):
         self._tray = TrayManager(WINDOW_TITLE, self._tray_show, self._tray_quit)
         self._sign_worker = SignWorker(self)
         self._log_date: datetime.date | None = None
+        self._progress_max = 1
 
         self._build_ui()
         self._load_config_to_ui()
@@ -59,14 +112,27 @@ class App(tk.Tk):
     # ── UI 构建 ──────────────────────────────────────────
 
     def _build_ui(self):
-        pad = {"padx": 12, "pady": 5}
+        # 顶部工具栏：主题切换
+        topbar = ctk.CTkFrame(self, fg_color="transparent", height=32)
+        topbar.pack(fill="x", padx=12, pady=(8, 0))
+        ctk.CTkLabel(topbar, text="外观:").pack(side="left")
+        self._theme_var = tk.StringVar(value=self.config_data.get("ui_theme", "system"))
+        ctk.CTkSegmentedButton(
+            topbar,
+            values=["system", "light", "dark"],
+            variable=self._theme_var,
+            command=self._on_theme_change,
+            width=180,
+        ).pack(side="left", padx=(6, 0))
 
-        self._notebook = ttk.Notebook(self)
-        self._notebook.pack(fill="both", expand=True, padx=4, pady=4)
+        # 主选项卡
+        self._tabview = ctk.CTkTabview(self, corner_radius=10)
+        self._tabview.pack(fill="both", expand=True, padx=12, pady=10)
 
-        tieba_tab = ttk.Frame(self._notebook)
-        self._notebook.add(tieba_tab, text="贴吧签到")
+        tieba_tab = self._tabview.add("贴吧签到")
+        ticket_tab_frame = self._tabview.add("抢票")
 
+        pad = {"padx": 8, "pady": 6}
         self._build_bduss_frame(tieba_tab, pad)
         self._build_actions_frame(tieba_tab, pad)
         self._build_schedule_frame(tieba_tab, pad)
@@ -76,62 +142,73 @@ class App(tk.Tk):
         self._build_log_frame(tieba_tab, pad)
 
         self._ticket_tab = TicketTab(
-            self._notebook,
+            ticket_tab_frame,
             config_data=self.config_data,
             on_save=lambda: save_config(self.config_data),
         )
-        self._notebook.add(self._ticket_tab, text="抢票")
+        self._ticket_tab.pack(fill="both", expand=True)
 
     def _build_bduss_frame(self, parent, pad):
-        frm = ttk.LabelFrame(parent, text="BDUSS 设置", padding=8)
-        frm.pack(fill="x", **pad)
-
-        ttk.Label(frm, text="BDUSS:").grid(row=0, column=0, sticky="w")
+        frm = _section(parent, "BDUSS 设置", fill="x", **pad)
+        ctk.CTkLabel(frm, text="BDUSS:").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self._bduss_var = tk.StringVar()
-        self._bduss_entry = ttk.Entry(
-            frm, textvariable=self._bduss_var, show="*", width=52
+        self._bduss_entry = ctk.CTkEntry(
+            frm, textvariable=self._bduss_var, show="*", width=460
         )
-        self._bduss_entry.grid(row=0, column=1, padx=(6, 4), sticky="ew")
+        self._bduss_entry.grid(row=0, column=1, padx=(0, 6), sticky="ew")
 
-        self._toggle_btn = ttk.Button(
-            frm, text="显示", width=5, command=self._toggle_show
+        self._toggle_btn = ctk.CTkButton(
+            frm, text="显示", width=58, command=self._toggle_show
         )
-        self._toggle_btn.grid(row=0, column=2, padx=(0, 4))
+        self._toggle_btn.grid(row=0, column=2)
         frm.columnconfigure(1, weight=1)
 
     def _build_actions_frame(self, parent, pad):
-        frm = ttk.Frame(parent)
+        frm = ctk.CTkFrame(parent, fg_color="transparent")
         frm.pack(fill="x", **pad)
 
-        self._save_btn = ttk.Button(frm, text="保存 BDUSS", command=self._on_save)
+        self._save_btn = ctk.CTkButton(
+            frm, text="保存 BDUSS", width=110, command=self._on_save
+        )
         self._save_btn.pack(side="left", padx=(0, 8))
 
-        self._sign_btn = ttk.Button(frm, text="逐个签到", command=self._on_sign)
+        self._sign_btn = ctk.CTkButton(
+            frm, text="逐个签到", width=100, command=self._on_sign
+        )
         self._sign_btn.pack(side="left", padx=(0, 8))
 
-        self._onekey_btn = ttk.Button(frm, text="一键签到", command=self._on_onekey)
+        self._onekey_btn = ctk.CTkButton(
+            frm, text="一键签到", width=100, command=self._on_onekey
+        )
         self._onekey_btn.pack(side="left", padx=(0, 8))
 
-        self._stop_btn = ttk.Button(
-            frm, text="停止签到", command=self._on_stop, state="disabled"
+        self._stop_btn = ctk.CTkButton(
+            frm,
+            text="停止签到",
+            width=100,
+            command=self._on_stop,
+            state="disabled",
+            fg_color="#C0392B",
+            hover_color="#A93226",
         )
         self._stop_btn.pack(side="left")
 
         self._status_var = tk.StringVar(value="就绪")
-        ttk.Label(frm, textvariable=self._status_var).pack(side="right", padx=4)
+        ctk.CTkLabel(frm, textvariable=self._status_var).pack(side="right", padx=4)
 
     def _build_schedule_frame(self, parent, pad):
-        frm = ttk.LabelFrame(parent, text="定时任务", padding=8)
-        frm.pack(fill="x", **pad)
+        frm = _section(parent, "定时任务", fill="x", **pad)
 
         self._schedule_enabled_var = tk.BooleanVar()
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             frm,
             text="启用定时签到",
             variable=self._schedule_enabled_var,
         ).grid(row=0, column=0, sticky="w")
 
-        ttk.Label(frm, text="执行时间:").grid(row=0, column=1, padx=(20, 4), sticky="e")
+        ctk.CTkLabel(frm, text="执行时间:").grid(
+            row=0, column=1, padx=(20, 4), sticky="e"
+        )
 
         self._hour_var = tk.StringVar(value="08")
         ttk.Spinbox(
@@ -144,7 +221,7 @@ class App(tk.Tk):
             wrap=True,
         ).grid(row=0, column=2)
 
-        ttk.Label(frm, text=":").grid(row=0, column=3)
+        ctk.CTkLabel(frm, text=":").grid(row=0, column=3, padx=2)
 
         self._minute_var = tk.StringVar(value="00")
         ttk.Spinbox(
@@ -157,38 +234,39 @@ class App(tk.Tk):
             wrap=True,
         ).grid(row=0, column=4)
 
-        self._schedule_save_btn = ttk.Button(
-            frm, text="保存设置", command=self._on_schedule_save
+        self._schedule_save_btn = ctk.CTkButton(
+            frm, text="保存设置", width=90, command=self._on_schedule_save
         )
         self._schedule_save_btn.grid(row=0, column=5, padx=(16, 0))
 
-        ttk.Label(frm, text="签到方式:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ctk.CTkLabel(frm, text="签到方式:").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
 
         self._schedule_mode_var = tk.StringVar(value="onekey")
-        ttk.Radiobutton(
+        ctk.CTkRadioButton(
             frm,
             text="一键签到 (失败自动切换逐个)",
             variable=self._schedule_mode_var,
             value="onekey",
-        ).grid(row=1, column=1, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Radiobutton(
+        ).grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0))
+        ctk.CTkRadioButton(
             frm,
             text="逐个签到",
             variable=self._schedule_mode_var,
             value="normal",
-        ).grid(row=1, column=4, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=4, columnspan=2, sticky="w", pady=(8, 0))
 
         self._schedule_info_var = tk.StringVar()
-        ttk.Label(frm, textvariable=self._schedule_info_var).grid(
-            row=2, column=0, columnspan=6, sticky="w", pady=(4, 0)
-        )
+        ctk.CTkLabel(
+            frm, textvariable=self._schedule_info_var, text_color=LOG_INFO
+        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
     def _build_startup_frame(self, parent, pad):
-        frm = ttk.LabelFrame(parent, text="开机自启", padding=8)
-        frm.pack(fill="x", **pad)
+        frm = _section(parent, "开机自启", fill="x", **pad)
 
         self._startup_enabled_var = tk.BooleanVar()
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             frm,
             text="开机自动启动",
             variable=self._startup_enabled_var,
@@ -196,57 +274,62 @@ class App(tk.Tk):
         ).grid(row=0, column=0, sticky="w")
 
         self._startup_minimize_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             frm,
             text="自启后缩小到托盘（无感启动）",
             variable=self._startup_minimize_var,
             command=self._refresh_startup_info,
         ).grid(row=0, column=1, padx=(18, 0), sticky="w")
 
-        self._startup_save_btn = ttk.Button(
-            frm, text="保存自启设置", command=self._on_startup_save
+        self._startup_save_btn = ctk.CTkButton(
+            frm, text="保存自启设置", width=110, command=self._on_startup_save
         )
         self._startup_save_btn.grid(row=0, column=2, padx=(16, 0))
 
         self._startup_info_var = tk.StringVar()
-        ttk.Label(frm, textvariable=self._startup_info_var).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(4, 0)
-        )
+        ctk.CTkLabel(
+            frm, textvariable=self._startup_info_var, text_color=LOG_INFO
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def _build_path_frame(self, parent, pad):
-        frm = ttk.Frame(parent)
+        frm = ctk.CTkFrame(parent, fg_color="transparent")
         frm.pack(fill="x", **pad)
-        ttk.Label(frm, text=f"配置: {CONFIG_FILE.name}  |  日志: {LOG_FILE.name}").pack(
-            side="left"
-        )
-        ttk.Button(frm, text="打开目录", width=8, command=self._open_config_dir).pack(
-            side="right"
-        )
+        ctk.CTkLabel(
+            frm, text=f"配置: {CONFIG_FILE.name}  |  日志: {LOG_FILE.name}"
+        ).pack(side="left")
+        ctk.CTkButton(
+            frm, text="打开目录", width=80, command=self._open_config_dir
+        ).pack(side="right")
 
     def _build_progress(self, parent, pad):
-        self._progress = ttk.Progressbar(parent, mode="determinate")
-        self._progress.pack(fill="x", **pad)
+        bar = ctk.CTkProgressBar(parent, height=14, corner_radius=4)
+        bar.set(0)
+        bar.pack(fill="x", **pad)
+        self._progress_bar = bar
+        self._progress = make_progress_compat(bar)
 
     def _build_log_frame(self, parent, pad):
-        frm = ttk.LabelFrame(parent, text="签到日志", padding=6)
-        frm.pack(fill="both", expand=True, **pad)
+        frm = _section(parent, "签到日志", fill="both", expand=True, **pad)
 
-        self._log_text = tk.Text(
+        self._log_text = ctk.CTkTextbox(
             frm,
-            height=14,
-            state="disabled",
-            font=("Consolas", 9),
+            height=200,
+            font=ctk.CTkFont(family="Consolas", size=12),
             wrap="word",
         )
-        scrollbar = ttk.Scrollbar(frm, command=self._log_text.yview)
-        self._log_text.configure(yscrollcommand=scrollbar.set)
+        self._log_text.pack(fill="both", expand=True)
+        self._log_text.configure(state="disabled")
 
-        self._log_text.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self._log_text.tag_config("ok", foreground=LOG_OK)
+        self._log_text.tag_config("fail", foreground=LOG_FAIL)
+        self._log_text.tag_config("info", foreground=LOG_INFO)
 
-        self._log_text.tag_configure("ok", foreground="#228B22")
-        self._log_text.tag_configure("fail", foreground="#CC0000")
-        self._log_text.tag_configure("info", foreground="#1E90FF")
+    # ── 主题切换 ─────────────────────────────────────────
+
+    def _on_theme_change(self, value: str):
+        ctk.set_appearance_mode(value)
+        self.config_data["ui_theme"] = value
+        save_config(self.config_data)
 
     # ── 打开配置目录 ──────────────────────────────────────
 
@@ -327,7 +410,10 @@ class App(tk.Tk):
         self._roll_log_if_new_day()
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         self._log_text.configure(state="normal")
-        self._log_text.insert("end", f"[{ts}] {text}\n", tag)
+        if tag:
+            self._log_text.insert("end", f"[{ts}] {text}\n", tag)
+        else:
+            self._log_text.insert("end", f"[{ts}] {text}\n")
         self._log_text.see("end")
         self._log_text.configure(state="disabled")
         clean = text.strip()
@@ -434,7 +520,7 @@ class App(tk.Tk):
         self.config_data["bduss"] = bduss
         self._signing = True
         self._set_busy(True)
-        self._progress["value"] = 0
+        self._progress_bar.set(0)
         self._log("──── 手动触发：逐个签到 ────", "info")
         threading.Thread(target=self._sign_worker.run_normal, daemon=True).start()
 
@@ -448,7 +534,7 @@ class App(tk.Tk):
         self.config_data["bduss"] = bduss
         self._signing = True
         self._set_busy(True)
-        self._progress["value"] = 0
+        self._progress_bar.set(0)
         self._log("──── 手动触发：一键签到 ────", "info")
         threading.Thread(target=self._sign_worker.run_onekey, daemon=True).start()
 
@@ -484,7 +570,7 @@ class App(tk.Tk):
                 last_run_date = today
                 self._signing = True
                 self._ui(self._set_busy, True)
-                self._ui(self._progress.configure, value=0)
+                self._ui(self._progress_bar.set, 0)
 
                 mode = self.config_data.get("schedule_mode", "onekey")
                 self._ui(

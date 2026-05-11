@@ -23,6 +23,11 @@ DEFAULT_CONFIG = {
     "12306_auto_order_enabled": False,
     "12306_auto_order_dry_run": True,
     "12306_auto_order_passengers": [],
+    "ui_theme": "system",
+    "ui_color": "blue",
+    "chrome_path": "",
+    "chrome_user_data_dir": "",
+    "chrome_debug_port": 9222,
 }
 
 
