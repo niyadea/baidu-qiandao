@@ -1,20 +1,48 @@
-"""百度贴吧自动签到工具 - CustomTkinter 现代风格主窗口。"""
+"""百度贴吧 + 12306 + 大麦 抢票助手 — Win11 Fluent Design 主窗口。
+
+UI 设计：
+  • 全局视觉常量：ui.styling
+  • 自定义控件：ui.widgets（Card / SectionCard / LogView / IntSpinBox / SelectableList）
+  • 主窗口 + Toplevel 都会尝试套 Mica 材质（Win11 22000+ 自动生效，旧系统降级）
+  • Worker 通过线程安全回调与 UI 通信
+"""
+
+from __future__ import annotations
 
 import datetime
 import os
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+import traceback
+from tkinter import messagebox
 
 import customtkinter as ctk
 import requests
 
-from core import CONFIG_FILE, DEFAULT_CONFIG, LOG_FILE, load_config, logger, save_config
+from core import (
+    CONFIG_FILE,
+    DEFAULT_CONFIG,
+    LOG_FILE,
+    load_config,
+    logger,
+    save_config,
+)
 
+from . import styling as S
 from .sign_worker import SignWorker
 from .ticket_tab import TicketTab
 from .tray import TrayManager
+from .widgets import (
+    LogView,
+    PivotTabs,
+    ProgressWithLabel,
+    SectionCard,
+    accent_button,
+    danger_button,
+    standard_button,
+    subtle_button,
+)
 from .win_startup import (
     START_MINIMIZED_ARG,
     build_startup_command,
@@ -22,54 +50,9 @@ from .win_startup import (
     set_startup_enabled,
 )
 
-WINDOW_TITLE = "百度贴吧自动签到"
-WINDOW_SIZE = "760x880"
-
-LOG_OK = "#22A45D"
-LOG_FAIL = "#E04848"
-LOG_INFO = "#3D8DFF"
-
-
-def _section(parent, title: str, **pack_kw) -> ctk.CTkFrame:
-    """创建带标题的圆角卡片，返回内部内容容器。"""
-    outer = ctk.CTkFrame(parent, corner_radius=10)
-    outer.pack(**pack_kw)
-    ctk.CTkLabel(
-        outer,
-        text=title,
-        anchor="w",
-        font=ctk.CTkFont(size=13, weight="bold"),
-    ).pack(fill="x", padx=12, pady=(8, 2))
-    inner = ctk.CTkFrame(outer, fg_color="transparent")
-    inner.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-    return inner
-
-
-def make_progress_compat(progressbar: ctk.CTkProgressBar) -> "_ProgressCompat":
-    """让 ttk 风格的 progressbar.configure(maximum=N) / __setitem__('value', i)
-    继续工作（worker 仍按旧 API 调用）。"""
-    return _ProgressCompat(progressbar)
-
-
-class _ProgressCompat:
-    """适配 ttk.Progressbar API → CTkProgressBar.set(0..1)。"""
-
-    def __init__(self, bar: ctk.CTkProgressBar):
-        self._bar = bar
-        self._max = 1
-
-    def configure(self, **kw):
-        if "maximum" in kw:
-            self._max = max(1, int(kw["maximum"]))
-            self._bar.set(0)
-        if "value" in kw:
-            self.__setitem__("value", kw["value"])
-
-    def __setitem__(self, key, value):
-        if key == "value":
-            self._bar.set(min(1.0, value / self._max))
-        elif key == "maximum":
-            self._max = max(1, int(value))
+WINDOW_TITLE = "百度贴吧 / 12306 / 大麦 抢票助手"
+DEFAULT_SIZE = (920, 940)
+MIN_SIZE = (820, 760)
 
 
 class App(ctk.CTk):
@@ -78,15 +61,13 @@ class App(ctk.CTk):
         self._start_minimized = start_minimized
 
         self.config_data = load_config()
-        ctk.set_appearance_mode(self.config_data.get("ui_theme", "system"))
-        ctk.set_default_color_theme(self.config_data.get("ui_color", "blue"))
+        S.apply_theme(
+            self.config_data.get("ui_theme", "system"),
+            self.config_data.get("ui_color", "blue"),
+        )
 
-        self.title(WINDOW_TITLE)
-        self.resizable(False, False)
-        w, h = (int(x) for x in WINDOW_SIZE.split("x"))
-        x = (self.winfo_screenwidth() - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        self._init_window()
+        self._install_exception_hook()
 
         self._signing = False
         self._show_bduss = False
@@ -94,52 +75,94 @@ class App(ctk.CTk):
         self._current_session: requests.Session | None = None
         self._tray = TrayManager(WINDOW_TITLE, self._tray_show, self._tray_quit)
         self._sign_worker = SignWorker(self)
-        self._log_date: datetime.date | None = None
-        self._progress_max = 1
 
         self._build_ui()
         self._load_config_to_ui()
         self._log_startup_status()
         self._start_scheduler()
+
         self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
         self.bind("<Unmap>", self._on_minimize)
+
+        # Win11 风格的标题栏 + 边框装饰
+        self.after(50, lambda: S.apply_window_chrome(self))
+
         if self._start_minimized and self.config_data.get(
             "startup_minimize_to_tray", True
         ):
             self.withdraw()
             self.after(100, self._minimize_to_tray)
 
+    # ── 窗口 / 异常 ─────────────────────────────────────
+
+    def _init_window(self):
+        self.title(WINDOW_TITLE)
+        self.minsize(*MIN_SIZE)
+        w, h = DEFAULT_SIZE
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2 - 20
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.configure(fg_color=S.WIN_BG)
+
+    def _install_exception_hook(self):
+        original = self.report_callback_exception
+
+        def hook(exc, val, tb):
+            logger.error(
+                "UI 异常:\n" + "".join(traceback.format_exception(exc, val, tb))
+            )
+            try:
+                messagebox.showerror(
+                    "程序异常",
+                    f"发生了未处理异常:\n\n{type(val).__name__}: {val}\n\n"
+                    f"详细堆栈已写入 {LOG_FILE.name}",
+                )
+            except Exception:
+                pass
+            original(exc, val, tb)
+
+        self.report_callback_exception = hook
+
     # ── UI 构建 ──────────────────────────────────────────
 
     def _build_ui(self):
-        # 顶部工具栏：主题切换
-        topbar = ctk.CTkFrame(self, fg_color="transparent", height=32)
-        topbar.pack(fill="x", padx=12, pady=(8, 0))
-        ctk.CTkLabel(topbar, text="外观:").pack(side="left")
+        # 顶部 header（标题 + 主题切换器）
+        header = ctk.CTkFrame(self, fg_color="transparent", height=56)
+        header.pack(fill="x", padx=S.SPACE_XL, pady=(S.SPACE_LG, S.SPACE_SM))
+        header.pack_propagate(False)
+
+        ctk.CTkLabel(
+            header, text=WINDOW_TITLE,
+            font=S.font_title(S.SUBTITLE),
+            text_color=S.TEXT_PRIMARY,
+            anchor="w",
+        ).pack(side="left", pady=4)
+
         self._theme_var = tk.StringVar(value=self.config_data.get("ui_theme", "system"))
         ctk.CTkSegmentedButton(
-            topbar,
+            header,
             values=["system", "light", "dark"],
             variable=self._theme_var,
             command=self._on_theme_change,
-            width=180,
-        ).pack(side="left", padx=(6, 0))
+            width=220,
+            height=30,
+            corner_radius=S.RADIUS_BUTTON,
+            font=S.font_body(),
+            selected_color=S.accent_pair(),
+            selected_hover_color=S.accent_hover_pair(),
+        ).pack(side="right", pady=4)
 
-        # 主选项卡
-        self._tabview = ctk.CTkTabview(self, corner_radius=10)
-        self._tabview.pack(fill="both", expand=True, padx=12, pady=10)
+        # Pivot Tabs（贴吧风格：底部 accent 下划线指示器）
+        self._tabview = PivotTabs(self)
+        self._tabview.pack(
+            fill="both", expand=True,
+            padx=S.SPACE_XL, pady=(S.SPACE_SM, S.SPACE_XL),
+        )
 
         tieba_tab = self._tabview.add("贴吧签到")
-        ticket_tab_frame = self._tabview.add("抢票")
+        ticket_tab_frame = self._tabview.add("抢票 (12306 / 大麦)")
 
-        pad = {"padx": 8, "pady": 6}
-        self._build_bduss_frame(tieba_tab, pad)
-        self._build_actions_frame(tieba_tab, pad)
-        self._build_schedule_frame(tieba_tab, pad)
-        self._build_startup_frame(tieba_tab, pad)
-        self._build_path_frame(tieba_tab, pad)
-        self._build_progress(tieba_tab, pad)
-        self._build_log_frame(tieba_tab, pad)
+        self._build_tieba_tab(tieba_tab)
 
         self._ticket_tab = TicketTab(
             ticket_tab_frame,
@@ -148,181 +171,190 @@ class App(ctk.CTk):
         )
         self._ticket_tab.pack(fill="both", expand=True)
 
-    def _build_bduss_frame(self, parent, pad):
-        frm = _section(parent, "BDUSS 设置", fill="x", **pad)
-        ctk.CTkLabel(frm, text="BDUSS:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+    def _build_tieba_tab(self, parent):
+        pad = {"padx": S.SPACE_MD, "pady": S.SPACE_SM}
+
+        # BDUSS
+        card = SectionCard(parent, title="BDUSS 设置")
+        card.pack(fill="x", **pad)
+        body = card.body
+        body.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            body, text="BDUSS",
+            font=S.font_body(), text_color=S.TEXT_SECONDARY,
+        ).grid(row=0, column=0, sticky="w", padx=(0, S.SPACE_MD))
         self._bduss_var = tk.StringVar()
         self._bduss_entry = ctk.CTkEntry(
-            frm, textvariable=self._bduss_var, show="*", width=460
+            body, textvariable=self._bduss_var, show="*",
+            height=S.INPUT_HEIGHT,
+            corner_radius=S.RADIUS_INPUT,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER_ALT,
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
         )
-        self._bduss_entry.grid(row=0, column=1, padx=(0, 6), sticky="ew")
-
-        self._toggle_btn = ctk.CTkButton(
-            frm, text="显示", width=58, command=self._toggle_show
+        self._bduss_entry.grid(row=0, column=1, sticky="ew", padx=(0, S.SPACE_SM))
+        self._toggle_btn = standard_button(
+            body, "显示", self._toggle_show, width=64,
         )
         self._toggle_btn.grid(row=0, column=2)
-        frm.columnconfigure(1, weight=1)
 
-    def _build_actions_frame(self, parent, pad):
-        frm = ctk.CTkFrame(parent, fg_color="transparent")
-        frm.pack(fill="x", **pad)
-
-        self._save_btn = ctk.CTkButton(
-            frm, text="保存 BDUSS", width=110, command=self._on_save
+        # 操作按钮
+        actions = ctk.CTkFrame(parent, fg_color="transparent")
+        actions.pack(fill="x", **pad)
+        self._save_btn = standard_button(
+            actions, "保存 BDUSS", self._on_save, width=100
         )
-        self._save_btn.pack(side="left", padx=(0, 8))
-
-        self._sign_btn = ctk.CTkButton(
-            frm, text="逐个签到", width=100, command=self._on_sign
+        self._save_btn.pack(side="left", padx=(0, S.SPACE_SM))
+        self._sign_btn = accent_button(
+            actions, "逐个签到", self._on_sign, width=100,
         )
-        self._sign_btn.pack(side="left", padx=(0, 8))
-
-        self._onekey_btn = ctk.CTkButton(
-            frm, text="一键签到", width=100, command=self._on_onekey
+        self._sign_btn.pack(side="left", padx=(0, S.SPACE_SM))
+        self._onekey_btn = accent_button(
+            actions, "一键签到", self._on_onekey, width=100,
         )
-        self._onekey_btn.pack(side="left", padx=(0, 8))
-
-        self._stop_btn = ctk.CTkButton(
-            frm,
-            text="停止签到",
-            width=100,
-            command=self._on_stop,
-            state="disabled",
-            fg_color="#C0392B",
-            hover_color="#A93226",
+        self._onekey_btn.pack(side="left", padx=(0, S.SPACE_SM))
+        self._stop_btn = danger_button(
+            actions, "停止签到", self._on_stop, width=100, state="disabled",
         )
         self._stop_btn.pack(side="left")
 
         self._status_var = tk.StringVar(value="就绪")
-        ctk.CTkLabel(frm, textvariable=self._status_var).pack(side="right", padx=4)
+        ctk.CTkLabel(
+            actions, textvariable=self._status_var,
+            text_color=S.TEXT_SECONDARY, font=S.font_body(),
+        ).pack(side="right")
 
-    def _build_schedule_frame(self, parent, pad):
-        frm = _section(parent, "定时任务", fill="x", **pad)
+        # 定时任务
+        card = SectionCard(parent, title="定时任务")
+        card.pack(fill="x", **pad)
+        body = card.body
 
         self._schedule_enabled_var = tk.BooleanVar()
         ctk.CTkCheckBox(
-            frm,
-            text="启用定时签到",
+            body, text="启用每日定时签到",
             variable=self._schedule_enabled_var,
+            font=S.font_body(),
+            text_color=S.TEXT_PRIMARY,
+            fg_color=S.accent_pair(),
+            hover_color=S.accent_hover_pair(),
+            border_color=S.TEXT_TERTIARY,
+            checkmark_color=S.TEXT_ON_ACCENT,
+            corner_radius=S.RADIUS_INPUT - 1,
         ).grid(row=0, column=0, sticky="w")
 
-        ctk.CTkLabel(frm, text="执行时间:").grid(
-            row=0, column=1, padx=(20, 4), sticky="e"
-        )
-
+        ctk.CTkLabel(
+            body, text="时间", font=S.font_body(), text_color=S.TEXT_SECONDARY,
+        ).grid(row=0, column=1, padx=(S.SPACE_LG, S.SPACE_SM), sticky="e")
         self._hour_var = tk.StringVar(value="08")
-        ttk.Spinbox(
-            frm,
-            from_=0,
-            to=23,
-            width=3,
-            format="%02.0f",
-            textvariable=self._hour_var,
-            wrap=True,
-        ).grid(row=0, column=2)
-
-        ctk.CTkLabel(frm, text=":").grid(row=0, column=3, padx=2)
-
         self._minute_var = tk.StringVar(value="00")
-        ttk.Spinbox(
-            frm,
-            from_=0,
-            to=59,
-            width=3,
-            format="%02.0f",
-            textvariable=self._minute_var,
-            wrap=True,
-        ).grid(row=0, column=4)
+        self._make_time_entry(body, self._hour_var).grid(row=0, column=2)
+        ctk.CTkLabel(
+            body, text=":", font=S.font_body(14, "bold"), text_color=S.TEXT_PRIMARY,
+        ).grid(row=0, column=3, padx=2)
+        self._make_time_entry(body, self._minute_var).grid(row=0, column=4)
 
-        self._schedule_save_btn = ctk.CTkButton(
-            frm, text="保存设置", width=90, command=self._on_schedule_save
-        )
-        self._schedule_save_btn.grid(row=0, column=5, padx=(16, 0))
+        accent_button(
+            body, "保存设置", self._on_schedule_save, width=100, height=30,
+        ).grid(row=0, column=5, padx=(S.SPACE_LG, 0))
 
-        ctk.CTkLabel(frm, text="签到方式:").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-
+        ctk.CTkLabel(
+            body, text="签到方式", font=S.font_body(), text_color=S.TEXT_SECONDARY,
+        ).grid(row=1, column=0, sticky="w", pady=(S.SPACE_MD, 0))
         self._schedule_mode_var = tk.StringVar(value="onekey")
         ctk.CTkRadioButton(
-            frm,
-            text="一键签到 (失败自动切换逐个)",
-            variable=self._schedule_mode_var,
-            value="onekey",
-        ).grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0))
+            body, text="一键 (失败回退逐个)",
+            variable=self._schedule_mode_var, value="onekey",
+            font=S.font_body(), text_color=S.TEXT_PRIMARY,
+            fg_color=S.accent_pair(),
+            hover_color=S.accent_hover_pair(),
+            border_color=S.TEXT_TERTIARY,
+        ).grid(row=1, column=1, columnspan=3, sticky="w", pady=(S.SPACE_MD, 0))
         ctk.CTkRadioButton(
-            frm,
-            text="逐个签到",
-            variable=self._schedule_mode_var,
-            value="normal",
-        ).grid(row=1, column=4, columnspan=2, sticky="w", pady=(8, 0))
+            body, text="逐个签到",
+            variable=self._schedule_mode_var, value="normal",
+            font=S.font_body(), text_color=S.TEXT_PRIMARY,
+            fg_color=S.accent_pair(),
+            hover_color=S.accent_hover_pair(),
+            border_color=S.TEXT_TERTIARY,
+        ).grid(row=1, column=4, columnspan=2, sticky="w", pady=(S.SPACE_MD, 0))
 
         self._schedule_info_var = tk.StringVar()
         ctk.CTkLabel(
-            frm, textvariable=self._schedule_info_var, text_color=LOG_INFO
-        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
+            body, textvariable=self._schedule_info_var,
+            text_color=S.INFO, font=S.font_body(),
+        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(S.SPACE_SM, 0))
 
-    def _build_startup_frame(self, parent, pad):
-        frm = _section(parent, "开机自启", fill="x", **pad)
+        # 开机自启
+        card = SectionCard(parent, title="开机自启")
+        card.pack(fill="x", **pad)
+        body = card.body
 
         self._startup_enabled_var = tk.BooleanVar()
         ctk.CTkCheckBox(
-            frm,
-            text="开机自动启动",
-            variable=self._startup_enabled_var,
+            body, text="开机自动启动", variable=self._startup_enabled_var,
             command=self._refresh_startup_info,
+            font=S.font_body(), text_color=S.TEXT_PRIMARY,
+            fg_color=S.accent_pair(),
+            hover_color=S.accent_hover_pair(),
+            border_color=S.TEXT_TERTIARY,
+            corner_radius=S.RADIUS_INPUT - 1,
         ).grid(row=0, column=0, sticky="w")
-
         self._startup_minimize_var = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            frm,
-            text="自启后缩小到托盘（无感启动）",
+            body, text="自启后缩小到托盘（无感启动）",
             variable=self._startup_minimize_var,
             command=self._refresh_startup_info,
-        ).grid(row=0, column=1, padx=(18, 0), sticky="w")
+            font=S.font_body(), text_color=S.TEXT_PRIMARY,
+            fg_color=S.accent_pair(),
+            hover_color=S.accent_hover_pair(),
+            border_color=S.TEXT_TERTIARY,
+            corner_radius=S.RADIUS_INPUT - 1,
+        ).grid(row=0, column=1, padx=(S.SPACE_LG, 0), sticky="w")
 
-        self._startup_save_btn = ctk.CTkButton(
-            frm, text="保存自启设置", width=110, command=self._on_startup_save
-        )
-        self._startup_save_btn.grid(row=0, column=2, padx=(16, 0))
+        accent_button(
+            body, "保存自启设置", self._on_startup_save, width=120, height=30,
+        ).grid(row=0, column=2, padx=(S.SPACE_LG, 0))
 
         self._startup_info_var = tk.StringVar()
         ctk.CTkLabel(
-            frm, textvariable=self._startup_info_var, text_color=LOG_INFO
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            body, textvariable=self._startup_info_var,
+            text_color=S.INFO, font=S.font_body(),
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(S.SPACE_SM, 0))
 
-    def _build_path_frame(self, parent, pad):
-        frm = ctk.CTkFrame(parent, fg_color="transparent")
-        frm.pack(fill="x", **pad)
+        # 路径条
+        path_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        path_bar.pack(fill="x", **pad)
         ctk.CTkLabel(
-            frm, text=f"配置: {CONFIG_FILE.name}  |  日志: {LOG_FILE.name}"
+            path_bar,
+            text=f"配置: {CONFIG_FILE.name}   ·   日志: {LOG_FILE.name}",
+            text_color=S.TEXT_TERTIARY, font=S.font_body(),
         ).pack(side="left")
-        ctk.CTkButton(
-            frm, text="打开目录", width=80, command=self._open_config_dir
+        subtle_button(
+            path_bar, "打开目录", self._open_config_dir, width=80,
         ).pack(side="right")
 
-    def _build_progress(self, parent, pad):
-        bar = ctk.CTkProgressBar(parent, height=14, corner_radius=4)
-        bar.set(0)
-        bar.pack(fill="x", **pad)
-        self._progress_bar = bar
-        self._progress = make_progress_compat(bar)
+        # 进度条
+        self._progress = ProgressWithLabel(parent, height=6)
+        self._progress.pack(fill="x", **pad)
 
-    def _build_log_frame(self, parent, pad):
-        frm = _section(parent, "签到日志", fill="both", expand=True, **pad)
+        # 日志
+        log_card = SectionCard(parent, title="签到日志")
+        log_card.pack(fill="both", expand=True, **pad)
+        self._log_view = LogView(log_card.body, height=240, show_clear_btn=True)
+        self._log_view.pack(fill="both", expand=True)
 
-        self._log_text = ctk.CTkTextbox(
-            frm,
-            height=200,
-            font=ctk.CTkFont(family="Consolas", size=12),
-            wrap="word",
+    def _make_time_entry(self, parent, var: tk.StringVar) -> ctk.CTkEntry:
+        return ctk.CTkEntry(
+            parent, textvariable=var, width=46, height=30,
+            justify="center",
+            corner_radius=S.RADIUS_INPUT,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER_ALT,
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
         )
-        self._log_text.pack(fill="both", expand=True)
-        self._log_text.configure(state="disabled")
-
-        self._log_text.tag_config("ok", foreground=LOG_OK)
-        self._log_text.tag_config("fail", foreground=LOG_FAIL)
-        self._log_text.tag_config("info", foreground=LOG_INFO)
 
     # ── 主题切换 ─────────────────────────────────────────
 
@@ -330,11 +362,27 @@ class App(ctk.CTk):
         ctk.set_appearance_mode(value)
         self.config_data["ui_theme"] = value
         save_config(self.config_data)
+        S.apply_window_chrome(self)
+        try:
+            self._tabview.refresh_theme()
+        except AttributeError:
+            pass
+        try:
+            self._ticket_tab.refresh_theme()
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            self._log_view.refresh_theme()
+        except AttributeError:
+            pass
 
     # ── 打开配置目录 ──────────────────────────────────────
 
     def _open_config_dir(self):
-        os.startfile(str(CONFIG_FILE.parent))
+        try:
+            os.startfile(str(CONFIG_FILE.parent))
+        except OSError as e:
+            messagebox.showerror("无法打开目录", str(e))
 
     # ── 配置 ↔ UI ────────────────────────────────────────
 
@@ -349,6 +397,7 @@ class App(ctk.CTk):
         self._minute_var.set(parts[1].zfill(2) if len(parts) >= 2 else "00")
         self._schedule_mode_var.set(cfg.get("schedule_mode", "onekey"))
         self._refresh_schedule_info()
+
         self._startup_enabled_var.set(is_startup_enabled())
         self._startup_minimize_var.set(cfg.get("startup_minimize_to_tray", True))
         self._refresh_startup_info()
@@ -361,16 +410,14 @@ class App(ctk.CTk):
     def _refresh_schedule_info(self):
         if self._schedule_enabled_var.get():
             t = self._read_schedule_time()
-            mode = (
-                "一键签到" if self._schedule_mode_var.get() == "onekey" else "逐个签到"
-            )
-            self._schedule_info_var.set(f"定时任务已启用，每天 {t} 自动执行{mode}")
+            mode = "一键签到" if self._schedule_mode_var.get() == "onekey" else "逐个签到"
+            self._schedule_info_var.set(f"已启用 — 每天 {t} 自动执行【{mode}】")
         else:
-            self._schedule_info_var.set("定时任务未启用")
+            self._schedule_info_var.set("未启用")
 
     def _refresh_startup_info(self):
         if os.name != "nt":
-            self._startup_info_var.set("当前系统不支持写入 Windows 开机启动项")
+            self._startup_info_var.set("当前系统不支持 Windows 开机启动项")
             return
         if self._startup_enabled_var.get():
             mode = (
@@ -378,9 +425,9 @@ class App(ctk.CTk):
                 if self._startup_minimize_var.get()
                 else "启动后显示窗口"
             )
-            self._startup_info_var.set(f"开机自启已选择，{mode}")
+            self._startup_info_var.set(f"已启用 — {mode}")
         else:
-            self._startup_info_var.set("开机自启未启用")
+            self._startup_info_var.set("未启用")
 
     def _log_startup_status(self):
         enabled = is_startup_enabled()
@@ -391,7 +438,7 @@ class App(ctk.CTk):
         )
         arg_mode = "，本次按自启参数启动" if self._start_minimized else ""
         self._log(
-            f"开机自启状态: {'已启用' if enabled else '未启用'}，自启后{mode}{arg_mode}",
+            f"开机自启: {'已启用' if enabled else '未启用'}，自启后{mode}{arg_mode}",
             "info",
         )
 
@@ -402,43 +449,13 @@ class App(ctk.CTk):
         self._bduss_entry.configure(show="" if self._show_bduss else "*")
         self._toggle_btn.configure(text="隐藏" if self._show_bduss else "显示")
 
-    # ── 日志输出 ─────────────────────────────────────────
+    # ── 日志 ─────────────────────────────────────────────
 
-    def _log(self, text: str, tag: str = ""):
-        """写入界面日志：日期变化时清空并写入分隔行；时间戳前缀仅出现在界面，
-        文件日志由 logger 自身的 formatter 负责加时间戳。"""
-        self._roll_log_if_new_day()
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        self._log_text.configure(state="normal")
-        if tag:
-            self._log_text.insert("end", f"[{ts}] {text}\n", tag)
-        else:
-            self._log_text.insert("end", f"[{ts}] {text}\n")
-        self._log_text.see("end")
-        self._log_text.configure(state="disabled")
+    def _log(self, text: str, tag: str = "info"):
+        self._log_view.log(text, tag if tag else "info")
         clean = text.strip()
         if clean:
             logger.info(clean)
-
-    def _roll_log_if_new_day(self):
-        today = datetime.date.today()
-        if self._log_date == today:
-            return
-        if self._log_date is not None:
-            self._log_text.configure(state="normal")
-            self._log_text.delete("1.0", "end")
-            self._log_text.configure(state="disabled")
-        header = f"━━━━━━ {today.isoformat()} ━━━━━━"
-        self._log_text.configure(state="normal")
-        self._log_text.insert("end", header + "\n", "info")
-        self._log_text.configure(state="disabled")
-        self._log_date = today
-
-    def _log_clear(self):
-        self._log_text.configure(state="normal")
-        self._log_text.delete("1.0", "end")
-        self._log_text.configure(state="disabled")
-        self._log_date = None
 
     # ── 按钮状态 ─────────────────────────────────────────
 
@@ -455,7 +472,10 @@ class App(ctk.CTk):
     def _on_stop(self):
         self._signing = False
         if self._current_session:
-            self._current_session.close()
+            try:
+                self._current_session.close()
+            except Exception:
+                pass
         self._log("用户手动停止签到", "fail")
         self._status_var.set("已停止")
 
@@ -474,6 +494,12 @@ class App(ctk.CTk):
     # ── 保存定时设置 ─────────────────────────────────────
 
     def _on_schedule_save(self):
+        try:
+            int(self._hour_var.get())
+            int(self._minute_var.get())
+        except ValueError:
+            messagebox.showwarning("提示", "时/分 必须是数字")
+            return
         self.config_data["schedule_enabled"] = self._schedule_enabled_var.get()
         self.config_data["schedule_time"] = self._read_schedule_time()
         self.config_data["schedule_mode"] = self._schedule_mode_var.get()
@@ -510,33 +536,27 @@ class App(ctk.CTk):
             "info",
         )
 
-    # ── 逐个签到 ─────────────────────────────────────────
+    # ── 签到入口 ─────────────────────────────────────────
+
+    def _start_sign_thread(self, target_name: str, action: str):
+        bduss = self._bduss_var.get().strip()
+        if not bduss:
+            messagebox.showwarning("提示", "请先输入 BDUSS")
+            return
+        self.config_data["bduss"] = bduss
+        self._signing = True
+        self._set_busy(True)
+        self._progress.reset()
+        self._log(f"──── 手动触发：{action} ────", "info")
+        threading.Thread(
+            target=getattr(self._sign_worker, target_name), daemon=True
+        ).start()
 
     def _on_sign(self):
-        bduss = self._bduss_var.get().strip()
-        if not bduss:
-            messagebox.showwarning("提示", "请先输入 BDUSS")
-            return
-        self.config_data["bduss"] = bduss
-        self._signing = True
-        self._set_busy(True)
-        self._progress_bar.set(0)
-        self._log("──── 手动触发：逐个签到 ────", "info")
-        threading.Thread(target=self._sign_worker.run_normal, daemon=True).start()
-
-    # ── 一键签到 ─────────────────────────────────────────
+        self._start_sign_thread("run_normal", "逐个签到")
 
     def _on_onekey(self):
-        bduss = self._bduss_var.get().strip()
-        if not bduss:
-            messagebox.showwarning("提示", "请先输入 BDUSS")
-            return
-        self.config_data["bduss"] = bduss
-        self._signing = True
-        self._set_busy(True)
-        self._progress_bar.set(0)
-        self._log("──── 手动触发：一键签到 ────", "info")
-        threading.Thread(target=self._sign_worker.run_onekey, daemon=True).start()
+        self._start_sign_thread("run_onekey", "一键签到")
 
     # ── 定时调度器 ───────────────────────────────────────
 
@@ -570,7 +590,7 @@ class App(ctk.CTk):
                 last_run_date = today
                 self._signing = True
                 self._ui(self._set_busy, True)
-                self._ui(self._progress_bar.set, 0)
+                self._ui(self._progress.reset)
 
                 mode = self.config_data.get("schedule_mode", "onekey")
                 self._ui(
@@ -579,7 +599,12 @@ class App(ctk.CTk):
                     f"{'一键签到' if mode == 'onekey' else '逐个签到'} ────",
                     "info",
                 )
-                self._sign_worker.run_scheduled(mode)
+                try:
+                    self._sign_worker.run_scheduled(mode)
+                except Exception as e:
+                    logger.error(f"定时任务异常: {e}\n{traceback.format_exc()}")
+                    self._ui(self._log, f"[定时任务异常] {e}", "fail")
+                    self._ui(self._finish)
 
     # ── 线程安全的 UI 更新 ───────────────────────────────
 
@@ -590,7 +615,7 @@ class App(ctk.CTk):
             self.after(0, func, *args)
 
     def _set_progress(self, value):
-        self._progress["value"] = value
+        self._progress.set_value(int(value))
 
     def _finish(self):
         self._signing = False
