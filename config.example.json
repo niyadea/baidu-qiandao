@@ -8,5 +8,15 @@
     "schedule_time": "08:00",
     "schedule_mode": "onekey",
     "startup_minimize_to_tray": true,
-    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "ollama_provider": "Ollama",
+    "ollama_endpoints": [
+        {
+            "name": "本机 Ollama",
+            "url": "http://localhost:11434",
+            "provider": "Ollama"
+        }
+    ],
+    "ollama_current_endpoint": "http://localhost:11434",
+    "ollama_send_shortcut": "enter"
 }

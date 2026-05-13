@@ -30,6 +30,7 @@ from core import (
 )
 
 from . import styling as S
+from .ollama_tab import OllamaTab
 from .sign_worker import SignWorker
 from .ticket_tab import TicketTab
 from .tray import TrayManager
@@ -81,8 +82,9 @@ class App(ctk.CTk):
         self._log_startup_status()
         self._start_scheduler()
 
-        self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self.bind("<Unmap>", self._on_minimize)
+        self._close_dialog: ctk.CTkToplevel | None = None
 
         # Win11 风格的标题栏 + 边框装饰
         self.after(50, lambda: S.apply_window_chrome(self))
@@ -126,41 +128,33 @@ class App(ctk.CTk):
     # ── UI 构建 ──────────────────────────────────────────
 
     def _build_ui(self):
-        # 顶部 header（标题 + 主题切换器）
-        header = ctk.CTkFrame(self, fg_color="transparent", height=56)
-        header.pack(fill="x", padx=S.SPACE_XL, pady=(S.SPACE_LG, S.SPACE_SM))
-        header.pack_propagate(False)
+        # 顶部菜单栏（仅保留主题切换图标，标题由系统标题栏承担）
+        menubar = ctk.CTkFrame(self, fg_color="transparent", height=32)
+        menubar.pack(fill="x", padx=S.SPACE_XL, pady=(S.SPACE_SM, 0))
+        menubar.pack_propagate(False)
 
-        ctk.CTkLabel(
-            header, text=WINDOW_TITLE,
-            font=S.font_title(S.SUBTITLE),
-            text_color=S.TEXT_PRIMARY,
-            anchor="w",
-        ).pack(side="left", pady=4)
-
-        self._theme_var = tk.StringVar(value=self.config_data.get("ui_theme", "system"))
-        ctk.CTkSegmentedButton(
-            header,
-            values=["system", "light", "dark"],
-            variable=self._theme_var,
-            command=self._on_theme_change,
-            width=220,
-            height=30,
-            corner_radius=S.RADIUS_BUTTON,
-            font=S.font_body(),
-            selected_color=S.accent_pair(),
-            selected_hover_color=S.accent_hover_pair(),
-        ).pack(side="right", pady=4)
+        current_theme = self.config_data.get("ui_theme", "system")
+        self._theme_var = tk.StringVar(value=current_theme)
+        self._theme_btn = subtle_button(
+            menubar,
+            text=self._theme_icon(current_theme),
+            command=self._cycle_theme,
+            width=28,
+            height=28,
+            font=S.font_body(14),
+        )
+        self._theme_btn.pack(side="right")
 
         # Pivot Tabs（贴吧风格：底部 accent 下划线指示器）
         self._tabview = PivotTabs(self)
         self._tabview.pack(
             fill="both", expand=True,
-            padx=S.SPACE_XL, pady=(S.SPACE_SM, S.SPACE_XL),
+            padx=S.SPACE_XL, pady=(S.SPACE_XS, S.SPACE_XL),
         )
 
         tieba_tab = self._tabview.add("贴吧签到")
         ticket_tab_frame = self._tabview.add("抢票 (12306 / 大麦)")
+        ollama_tab_frame = self._tabview.add("大模型")
 
         self._build_tieba_tab(tieba_tab)
 
@@ -170,6 +164,13 @@ class App(ctk.CTk):
             on_save=lambda: save_config(self.config_data),
         )
         self._ticket_tab.pack(fill="both", expand=True)
+
+        self._ollama_tab = OllamaTab(
+            ollama_tab_frame,
+            config_data=self.config_data,
+            on_save=lambda: save_config(self.config_data),
+        )
+        self._ollama_tab.pack(fill="both", expand=True)
 
     def _build_tieba_tab(self, parent):
         pad = {"padx": S.SPACE_MD, "pady": S.SPACE_SM}
@@ -358,11 +359,31 @@ class App(ctk.CTk):
 
     # ── 主题切换 ─────────────────────────────────────────
 
+    THEME_CYCLE = ("system", "light", "dark")
+    THEME_ICONS = {"system": "\U0001F5A5", "light": "\u2600", "dark": "\u263E"}
+
+    def _theme_icon(self, mode: str) -> str:
+        return self.THEME_ICONS.get(mode, self.THEME_ICONS["system"])
+
+    def _cycle_theme(self):
+        current = self._theme_var.get()
+        try:
+            idx = self.THEME_CYCLE.index(current)
+        except ValueError:
+            idx = -1
+        next_mode = self.THEME_CYCLE[(idx + 1) % len(self.THEME_CYCLE)]
+        self._theme_var.set(next_mode)
+        self._on_theme_change(next_mode)
+
     def _on_theme_change(self, value: str):
         ctk.set_appearance_mode(value)
         self.config_data["ui_theme"] = value
         save_config(self.config_data)
         S.apply_window_chrome(self)
+        try:
+            self._theme_btn.configure(text=self._theme_icon(value))
+        except (AttributeError, tk.TclError):
+            pass
         try:
             self._tabview.refresh_theme()
         except AttributeError:
@@ -643,13 +664,130 @@ class App(ctk.CTk):
         self.focus_force()
 
     def _tray_quit(self, icon=None, item=None):
-        self._tray.stop()
         self.after(0, self._on_close)
+
+    # ── 关闭请求（X 按钮）─────────────────────────────────
+
+    def _on_close_request(self):
+        """窗口 X 按钮触发：根据 close_action 配置决定行为或弹窗询问。"""
+        action = self.config_data.get("close_action", "ask")
+        if action == "minimize":
+            self._minimize_to_tray()
+            return
+        if action == "quit":
+            self._on_close()
+            return
+        self._show_close_dialog()
+
+    def _show_close_dialog(self):
+        if self._close_dialog is not None:
+            try:
+                self._close_dialog.lift()
+                self._close_dialog.focus_force()
+                return
+            except tk.TclError:
+                self._close_dialog = None
+
+        dlg = ctk.CTkToplevel(self)
+        self._close_dialog = dlg
+        dlg.title("关闭程序")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        dlg.configure(fg_color=S.WIN_BG)
+
+        w, h = 380, 200
+        try:
+            x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - h) // 2
+        except tk.TclError:
+            x = (self.winfo_screenwidth() - w) // 2
+            y = (self.winfo_screenheight() - h) // 2
+        dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+
+        ctk.CTkLabel(
+            dlg, text="你希望如何关闭程序？",
+            font=S.font_title(S.SUBTITLE),
+            text_color=S.TEXT_PRIMARY,
+        ).pack(pady=(S.SPACE_LG, S.SPACE_XS))
+        ctk.CTkLabel(
+            dlg, text="缩到托盘可继续在后台执行定时签到。",
+            font=S.font_body(), text_color=S.TEXT_SECONDARY,
+        ).pack(pady=(0, S.SPACE_MD))
+
+        remember_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            dlg, text="记住选择，下次不再询问",
+            variable=remember_var,
+            font=S.font_body(), text_color=S.TEXT_PRIMARY,
+            fg_color=S.accent_pair(), hover_color=S.accent_hover_pair(),
+            border_color=S.TEXT_TERTIARY,
+            checkmark_color=S.TEXT_ON_ACCENT,
+            corner_radius=S.RADIUS_INPUT - 1,
+        ).pack(pady=(0, S.SPACE_MD))
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(pady=(0, S.SPACE_LG))
+
+        def _do(action: str):
+            if action != "cancel" and remember_var.get():
+                self.config_data["close_action"] = action
+                save_config(self.config_data)
+            try:
+                dlg.grab_release()
+                dlg.destroy()
+            except tk.TclError:
+                pass
+            self._close_dialog = None
+            if action == "minimize":
+                self._minimize_to_tray()
+            elif action == "quit":
+                self._on_close()
+
+        standard_button(
+            btns, "缩到托盘", lambda: _do("minimize"), width=100,
+        ).pack(side="left", padx=S.SPACE_XS)
+        danger_button(
+            btns, "退出程序", lambda: _do("quit"), width=100,
+        ).pack(side="left", padx=S.SPACE_XS)
+        subtle_button(
+            btns, "取消", lambda: _do("cancel"), width=80,
+        ).pack(side="left", padx=S.SPACE_XS)
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _do("cancel"))
+        dlg.after(50, lambda: (dlg.grab_set(), dlg.focus_force()))
+
+    # ── 退出清理 ─────────────────────────────────────────
 
     def _on_close(self):
         self._scheduler_stop.set()
-        self._tray.stop()
-        self.destroy()
+        self._signing = False
+
+        if self._current_session is not None:
+            try:
+                self._current_session.close()
+            except Exception:
+                pass
+            self._current_session = None
+
+        try:
+            browser = getattr(self._ticket_tab, "_browser", None)
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+
+        try:
+            self._tray.stop()
+        except Exception:
+            pass
+
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+        # 兜底：强制退出，避免残留 daemon=False 的第三方线程或子进程拖住 Python
+        os._exit(0)
 
 
 def main():

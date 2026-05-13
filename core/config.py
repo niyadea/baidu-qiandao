@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
     "schedule_time": "08:00",
     "schedule_mode": "onekey",
     "startup_minimize_to_tray": True,
+    "close_action": "ask",  # ask | minimize | quit
     "user_agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -32,6 +33,12 @@ DEFAULT_CONFIG = {
     "chrome_path": "",
     "chrome_user_data_dir": "",
     "chrome_debug_port": 9222,
+    "ollama_provider": "Ollama",
+    "ollama_endpoints": [
+        {"name": "本机 Ollama", "url": "http://localhost:11434", "provider": "Ollama"},
+    ],
+    "ollama_current_endpoint": "http://localhost:11434",
+    "ollama_send_shortcut": "enter",
 }
 
 
