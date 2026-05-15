@@ -1,4 +1,4 @@
-"""百度贴吧 + 12306 + 大麦 抢票助手 — Win11 Fluent Design 主窗口。
+"""智能桌面助手 — Win11 Fluent Design 主窗口。
 
 UI 设计：
   • 全局视觉常量：ui.styling
@@ -51,7 +51,7 @@ from .win_startup import (
     set_startup_enabled,
 )
 
-WINDOW_TITLE = "百度贴吧 / 12306 / 大麦 抢票助手"
+WINDOW_TITLE = "智能桌面助手"
 DEFAULT_SIZE = (920, 940)
 MIN_SIZE = (820, 760)
 
@@ -76,6 +76,7 @@ class App(ctk.CTk):
         self._current_session: requests.Session | None = None
         self._tray = TrayManager(WINDOW_TITLE, self._tray_show, self._tray_quit)
         self._sign_worker = SignWorker(self)
+        self._agent_drawer_visible = False
 
         self._build_ui()
         self._load_config_to_ui()
@@ -133,6 +134,15 @@ class App(ctk.CTk):
         menubar.pack(fill="x", padx=S.SPACE_XL, pady=(S.SPACE_SM, 0))
         menubar.pack_propagate(False)
 
+        self._agent_btn = accent_button(
+            menubar,
+            "Agent",
+            self._toggle_agent_drawer,
+            width=76,
+            height=28,
+        )
+        self._agent_btn.pack(side="right", padx=(S.SPACE_SM, 0))
+
         current_theme = self.config_data.get("ui_theme", "system")
         self._theme_var = tk.StringVar(value=current_theme)
         self._theme_btn = subtle_button(
@@ -145,16 +155,20 @@ class App(ctk.CTk):
         )
         self._theme_btn.pack(side="right")
 
-        # Pivot Tabs（贴吧风格：底部 accent 下划线指示器）
-        self._tabview = PivotTabs(self)
-        self._tabview.pack(
+        self._main_shell = ctk.CTkFrame(self, fg_color="transparent")
+        self._main_shell.pack(
             fill="both", expand=True,
             padx=S.SPACE_XL, pady=(S.SPACE_XS, S.SPACE_XL),
         )
 
+        # Pivot Tabs（贴吧风格：底部 accent 下划线指示器）
+        self._tabview = PivotTabs(self._main_shell)
+        self._tabview.pack(
+            side="left", fill="both", expand=True,
+        )
+
         tieba_tab = self._tabview.add("贴吧签到")
         ticket_tab_frame = self._tabview.add("抢票 (12306 / 大麦)")
-        ollama_tab_frame = self._tabview.add("大模型")
 
         self._build_tieba_tab(tieba_tab)
 
@@ -165,12 +179,60 @@ class App(ctk.CTk):
         )
         self._ticket_tab.pack(fill="both", expand=True)
 
+        self._build_agent_drawer()
+
+    def _build_agent_drawer(self):
+        self._agent_drawer = ctk.CTkFrame(
+            self._main_shell,
+            width=380,
+            corner_radius=S.RADIUS_CARD,
+            border_width=1,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER,
+        )
+        self._agent_drawer.pack_propagate(False)
+
+        header = ctk.CTkFrame(self._agent_drawer, fg_color="transparent", height=40)
+        header.pack(fill="x", padx=S.SPACE_MD, pady=(S.SPACE_SM, 0))
+        header.pack_propagate(False)
+
+        ctk.CTkLabel(
+            header,
+            text="Agent",
+            font=S.font_title(S.SUBTITLE),
+            text_color=S.TEXT_PRIMARY,
+            anchor="w",
+        ).pack(side="left")
+
+        subtle_button(
+            header,
+            "关闭",
+            self._toggle_agent_drawer,
+            width=56,
+            height=28,
+        ).pack(side="right")
+
         self._ollama_tab = OllamaTab(
-            ollama_tab_frame,
+            self._agent_drawer,
             config_data=self.config_data,
             on_save=lambda: save_config(self.config_data),
+            compact=True,
         )
         self._ollama_tab.pack(fill="both", expand=True)
+
+    def _toggle_agent_drawer(self):
+        self._set_agent_drawer_visible(not self._agent_drawer_visible)
+
+    def _set_agent_drawer_visible(self, visible: bool):
+        self._agent_drawer_visible = visible
+        if visible:
+            self._agent_drawer.pack(
+                side="right", fill="y", padx=(S.SPACE_MD, 0)
+            )
+            self._agent_btn.configure(text="关闭")
+        else:
+            self._agent_drawer.pack_forget()
+            self._agent_btn.configure(text="Agent")
 
     def _build_tieba_tab(self, parent):
         pad = {"padx": S.SPACE_MD, "pady": S.SPACE_SM}

@@ -36,10 +36,11 @@ IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 class OllamaTab(ctk.CTkFrame):
     """A small Ollama client that can switch between multiple API endpoints."""
 
-    def __init__(self, parent, *, config_data: dict, on_save):
+    def __init__(self, parent, *, config_data: dict, on_save, compact: bool = False):
         super().__init__(parent, fg_color="transparent")
         self._config_data = config_data
         self._on_save = on_save
+        self._compact = compact
         self._models: list[str] = []
         self._histories: dict[str, list[dict[str, str]]] = {}
         self._chat_images: list[ImageTk.PhotoImage] = []
@@ -51,6 +52,10 @@ class OllamaTab(ctk.CTkFrame):
         self.after(200, self.refresh_models)
 
     def _build(self):
+        if self._compact:
+            self._build_compact()
+            return
+
         pad = {"padx": S.SPACE_MD, "pady": S.SPACE_SM}
 
         conn_card = SectionCard(self, title="大模型服务")
@@ -306,6 +311,425 @@ class OllamaTab(ctk.CTkFrame):
         )
         self._send_btn.pack(fill="both", expand=True)
 
+    def _build_compact(self):
+        pad = {"padx": S.SPACE_SM, "pady": S.SPACE_XS}
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        topbar = ctk.CTkFrame(self, fg_color="transparent", height=38)
+        topbar.grid(row=0, column=0, sticky="ew", **pad)
+        topbar.grid_columnconfigure(1, weight=1)
+        topbar.grid_propagate(False)
+
+        standard_button(
+            topbar,
+            "Agent 设置",
+            self._open_agent_settings,
+            width=96,
+            height=30,
+        ).grid(row=0, column=0, sticky="w", padx=(0, S.SPACE_SM))
+
+        self._model_var = tk.StringVar(value="")
+        self._model_menu = ctk.CTkOptionMenu(
+            topbar,
+            variable=self._model_var,
+            values=[EMPTY_MODEL_TEXT],
+            command=self._on_model_selected,
+            height=30,
+            corner_radius=S.RADIUS_INPUT,
+            fg_color=S.LAYER_ALT,
+            button_color=S.accent_pair(),
+            button_hover_color=S.accent_hover_pair(),
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+        )
+        self._model_menu.grid(row=0, column=1, sticky="ew")
+
+        self._refresh_btn = subtle_button(
+            topbar,
+            "刷新",
+            self.refresh_models,
+            width=48,
+            height=30,
+        )
+        self._refresh_btn.grid(row=0, column=2, sticky="e", padx=(S.SPACE_SM, 0))
+
+        self._provider_var = tk.StringVar(value=PROVIDER_OLLAMA)
+        self._endpoint_var = tk.StringVar()
+        self._endpoint_name_var = tk.StringVar()
+        self._base_url = tk.StringVar()
+        self._model_name_var = tk.StringVar(value="")
+        self._status_var = tk.StringVar(value="未连接")
+        self._settings_window: ctk.CTkToplevel | None = None
+        self._settings_model_menu: ctk.CTkOptionMenu | None = None
+        self._endpoint_menu: ctk.CTkOptionMenu | None = None
+
+        chat_card = SectionCard(self, title="对话", body_padx=S.SPACE_MD)
+        chat_card.grid(row=1, column=0, sticky="nsew", **pad)
+        self._chat_area = ctk.CTkScrollableFrame(
+            chat_card.body,
+            height=320,
+            corner_radius=S.RADIUS_INPUT,
+            border_width=1,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER_ALT,
+        )
+        self._chat_area.pack(fill="both", expand=True)
+
+        input_frame = ctk.CTkFrame(self, fg_color="transparent")
+        input_frame.grid(row=2, column=0, sticky="ew", **pad)
+        input_frame.columnconfigure(0, weight=1)
+
+        self._input = ctk.CTkTextbox(
+            input_frame,
+            height=74,
+            wrap="word",
+            corner_radius=S.RADIUS_INPUT,
+            border_width=1,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER_ALT,
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(13),
+        )
+        self._input.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._input.bind("<Return>", self._on_input_return)
+        self._input.bind("<Control-Return>", self._on_input_ctrl_return)
+
+        self._send_shortcut_var = tk.StringVar(
+            value=self._shortcut_label(
+                self._config_data.get("ollama_send_shortcut", "enter")
+            )
+        )
+        self._send_shortcut_menu = ctk.CTkOptionMenu(
+            input_frame,
+            variable=self._send_shortcut_var,
+            values=["Enter发送", "Ctrl+Enter发送"],
+            command=self._on_send_shortcut_changed,
+            width=116,
+            height=30,
+            corner_radius=S.RADIUS_INPUT,
+            fg_color=S.LAYER_ALT,
+            button_color=S.accent_pair(),
+            button_hover_color=S.accent_hover_pair(),
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(12),
+        )
+        self._send_shortcut_menu.grid(
+            row=1, column=0, sticky="w", pady=(S.SPACE_SM, 0)
+        )
+        self._send_btn = accent_button(
+            input_frame,
+            "发送",
+            self._send_message,
+            width=86,
+            height=30,
+        )
+        self._send_btn.grid(row=1, column=1, sticky="e", pady=(S.SPACE_SM, 0))
+
+    def _open_agent_settings(self):
+        if self._settings_window is not None:
+            try:
+                self._settings_window.lift()
+                self._settings_window.focus_force()
+                return
+            except tk.TclError:
+                self._settings_window = None
+
+        win = ctk.CTkToplevel(self)
+        self._settings_window = win
+        win.title("Agent 设置")
+        win.transient(self.winfo_toplevel())
+        win.geometry("980x680")
+        win.minsize(860, 580)
+        win.configure(fg_color=S.WIN_BG)
+        win.columnconfigure(0, weight=1)
+        win.columnconfigure(1, weight=1)
+        win.rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(win, fg_color="transparent", height=42)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=S.SPACE_LG, pady=(S.SPACE_MD, 0))
+        header.grid_columnconfigure(1, weight=1)
+        header.grid_propagate(False)
+
+        ctk.CTkLabel(
+            header,
+            text="Agent 设置",
+            font=S.font_title(S.TITLE),
+            text_color=S.TEXT_PRIMARY,
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            header,
+            textvariable=self._status_var,
+            font=S.font_body(),
+            text_color=S.TEXT_SECONDARY,
+        ).grid(row=0, column=1, sticky="e", padx=(0, S.SPACE_SM))
+        accent_button(
+            header,
+            "完成",
+            self._close_agent_settings,
+            width=72,
+            height=30,
+        ).grid(row=0, column=2, sticky="e")
+
+        edit = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        edit.grid(row=1, column=0, sticky="nsew", padx=(S.SPACE_LG, S.SPACE_SM), pady=S.SPACE_MD)
+        preview = ctk.CTkFrame(
+            win,
+            corner_radius=S.RADIUS_CARD,
+            border_width=1,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER,
+        )
+        preview.grid(row=1, column=1, sticky="nsew", padx=(S.SPACE_SM, S.SPACE_LG), pady=S.SPACE_MD)
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(1, weight=1)
+
+        self._build_agent_prompt_card(edit)
+        self._build_agent_model_card(edit)
+        self._build_agent_placeholder_card(
+            edit,
+            "知识库",
+            "装配工艺知识库尚未接入。后续可在这里添加工艺文档、标准规范、工艺卡、设备说明和常见问题。",
+        )
+        self._build_agent_placeholder_card(
+            edit,
+            "工具",
+            "后续可把贴吧签到、余票查询、开始轮询、停止任务等能力注册为 Agent 可调用工具。",
+        )
+
+        ctk.CTkLabel(
+            preview,
+            text="调试与预览",
+            font=S.font_strong(),
+            text_color=S.TEXT_PRIMARY,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=S.SPACE_LG, pady=(S.SPACE_LG, S.SPACE_SM))
+        ctk.CTkLabel(
+            preview,
+            text="设置保存后，可回到右侧 Agent 抽屉中直接对话调试。",
+            font=S.font_body(),
+            text_color=S.TEXT_SECONDARY,
+            anchor="nw",
+            justify="left",
+            wraplength=420,
+        ).grid(row=1, column=0, sticky="nsew", padx=S.SPACE_LG, pady=S.SPACE_SM)
+        bottom = ctk.CTkFrame(preview, fg_color=S.LAYER_ALT, corner_radius=S.RADIUS_INPUT)
+        bottom.grid(row=2, column=0, sticky="ew", padx=S.SPACE_LG, pady=(S.SPACE_SM, S.SPACE_LG))
+        bottom.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            bottom,
+            text="和 Bot 聊天",
+            font=S.font_body(),
+            text_color=S.TEXT_TERTIARY,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=S.SPACE_MD, pady=S.SPACE_SM)
+        accent_button(
+            bottom,
+            "发送",
+            lambda: None,
+            width=58,
+            height=30,
+        ).grid(row=0, column=1, sticky="e", padx=S.SPACE_SM, pady=S.SPACE_SM)
+
+        win.protocol("WM_DELETE_WINDOW", self._close_agent_settings)
+        self._load_endpoint_to_ui()
+        self._refresh_settings_model_menu()
+        self.after(50, lambda: S.apply_window_chrome(win))
+
+    def _close_agent_settings(self):
+        if self._settings_window is not None:
+            try:
+                self._settings_window.destroy()
+            except tk.TclError:
+                pass
+        self._settings_window = None
+        self._settings_model_menu = None
+        self._endpoint_menu = None
+
+    def _build_agent_prompt_card(self, parent):
+        card = SectionCard(parent, title="提示词")
+        card.pack(fill="x", padx=S.SPACE_SM, pady=S.SPACE_SM)
+        prompt = ctk.CTkTextbox(
+            card.body,
+            height=160,
+            wrap="word",
+            corner_radius=S.RADIUS_INPUT,
+            border_width=1,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER_ALT,
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+        )
+        prompt.pack(fill="x")
+        default_prompt = (
+            "你是桌面助手，负责协助用户完成贴吧签到、票务查询和本地大模型问答。\n"
+            "回答要准确、简洁；涉及执行操作时，先确认必要参数和风险。"
+        )
+        prompt.insert("1.0", self._config_data.get("agent_prompt", default_prompt))
+
+        def _save_prompt(_event=None):
+            self._config_data["agent_prompt"] = prompt.get("1.0", "end").strip()
+            self._on_save()
+
+        prompt.bind("<FocusOut>", _save_prompt)
+
+    def _build_agent_model_card(self, parent):
+        card = SectionCard(parent, title="模型配置")
+        card.pack(fill="x", padx=S.SPACE_SM, pady=S.SPACE_SM)
+        body = card.body
+        body.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(body, text="类型", font=S.font_body(), text_color=S.TEXT_SECONDARY).grid(
+            row=0, column=0, sticky="w", padx=(0, S.SPACE_SM)
+        )
+        self._provider_menu = ctk.CTkOptionMenu(
+            body,
+            variable=self._provider_var,
+            values=[PROVIDER_OLLAMA, PROVIDER_OTHER],
+            command=self._on_provider_selected,
+            height=S.INPUT_HEIGHT,
+            corner_radius=S.RADIUS_INPUT,
+            fg_color=S.LAYER_ALT,
+            button_color=S.accent_pair(),
+            button_hover_color=S.accent_hover_pair(),
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+        )
+        self._provider_menu.grid(row=0, column=1, sticky="ew")
+
+        ctk.CTkLabel(body, text="地址", font=S.font_body(), text_color=S.TEXT_SECONDARY).grid(
+            row=1, column=0, sticky="w", padx=(0, S.SPACE_SM), pady=(S.SPACE_SM, 0)
+        )
+
+        self._endpoint_menu = ctk.CTkOptionMenu(
+            body,
+            variable=self._endpoint_var,
+            values=["本机 Ollama"],
+            command=self._on_endpoint_selected,
+            height=S.INPUT_HEIGHT,
+            corner_radius=S.RADIUS_INPUT,
+            fg_color=S.LAYER_ALT,
+            button_color=S.accent_pair(),
+            button_hover_color=S.accent_hover_pair(),
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+        )
+        self._endpoint_menu.grid(row=1, column=1, sticky="ew", pady=(S.SPACE_SM, 0))
+
+        tools = ctk.CTkFrame(body, fg_color="transparent")
+        tools.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(S.SPACE_SM, 0))
+        tools.columnconfigure(1, weight=1)
+
+        standard_button(
+            tools,
+            "刷新模型",
+            self.refresh_models,
+            width=86,
+        ).grid(row=0, column=0, sticky="w", padx=(0, S.SPACE_SM))
+
+        ctk.CTkLabel(
+            tools,
+            textvariable=self._status_var,
+            font=S.font_body(),
+            text_color=S.TEXT_SECONDARY,
+            anchor="e",
+        ).grid(row=0, column=1, sticky="e")
+
+        ctk.CTkLabel(body, text="名称", font=S.font_body(), text_color=S.TEXT_SECONDARY).grid(
+            row=3, column=0, sticky="w", padx=(0, S.SPACE_SM), pady=(S.SPACE_SM, 0)
+        )
+
+        self._name_entry = ctk.CTkEntry(
+            body,
+            textvariable=self._endpoint_name_var,
+            height=S.INPUT_HEIGHT,
+            corner_radius=S.RADIUS_INPUT,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER_ALT,
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+            placeholder_text="名称",
+        )
+        self._name_entry.grid(row=3, column=1, sticky="ew", pady=(S.SPACE_SM, 0))
+
+        ctk.CTkLabel(body, text="链接", font=S.font_body(), text_color=S.TEXT_SECONDARY).grid(
+            row=4, column=0, sticky="w", padx=(0, S.SPACE_SM), pady=(S.SPACE_SM, 0)
+        )
+
+        self._url_entry = ctk.CTkEntry(
+            body,
+            textvariable=self._base_url,
+            height=S.INPUT_HEIGHT,
+            corner_radius=S.RADIUS_INPUT,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER_ALT,
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+            placeholder_text="http://localhost:11434",
+        )
+        self._url_entry.grid(row=4, column=1, sticky="ew", pady=(S.SPACE_SM, 0))
+
+        actions = ctk.CTkFrame(body, fg_color="transparent")
+        actions.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(S.SPACE_SM, 0))
+        standard_button(
+            actions,
+            "保存地址",
+            self._save_endpoint,
+            width=86,
+        ).pack(side="left", padx=(0, S.SPACE_SM))
+        danger_button(
+            actions,
+            "删除",
+            self._delete_endpoint,
+            width=58,
+            height=S.INPUT_HEIGHT,
+        ).pack(side="left")
+
+        ctk.CTkLabel(body, text="模型", font=S.font_body(), text_color=S.TEXT_SECONDARY).grid(
+            row=6, column=0, sticky="w", padx=(0, S.SPACE_SM), pady=(S.SPACE_MD, 0)
+        )
+
+        self._settings_model_menu = ctk.CTkOptionMenu(
+            body,
+            variable=self._model_var,
+            values=[EMPTY_MODEL_TEXT],
+            command=self._on_model_selected,
+            height=S.INPUT_HEIGHT,
+            corner_radius=S.RADIUS_INPUT,
+            fg_color=S.LAYER_ALT,
+            button_color=S.accent_pair(),
+            button_hover_color=S.accent_hover_pair(),
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+        )
+        self._settings_model_menu.grid(row=6, column=1, sticky="ew", pady=(S.SPACE_MD, 0))
+
+        self._model_entry = ctk.CTkEntry(
+            body,
+            textvariable=self._model_name_var,
+            height=S.INPUT_HEIGHT,
+            corner_radius=S.RADIUS_INPUT,
+            border_color=S.LAYER_BORDER,
+            fg_color=S.LAYER_ALT,
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+            placeholder_text="可手动输入模型名",
+        )
+        self._model_entry.grid(row=7, column=1, sticky="ew", pady=(S.SPACE_SM, 0))
+
+    def _build_agent_placeholder_card(self, parent, title: str, message: str):
+        card = SectionCard(parent, title=title)
+        card.pack(fill="x", padx=S.SPACE_SM, pady=S.SPACE_SM)
+        ctk.CTkLabel(
+            card.body,
+            text=message,
+            font=S.font_body(),
+            text_color=S.TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        ).pack(fill="x")
+
     def refresh_models(self):
         self._save_current_endpoint_selection()
         self._refresh_btn.configure(state="disabled")
@@ -350,6 +774,7 @@ class OllamaTab(ctk.CTkFrame):
         self._models = models
         if not models:
             self._model_menu.configure(values=[NO_MODEL_TEXT])
+            self._refresh_settings_model_menu([NO_MODEL_TEXT])
             self._model_var.set(NO_MODEL_TEXT)
             self._model_name_var.set("")
             self._status_var.set("0 个模型")
@@ -360,6 +785,7 @@ class OllamaTab(ctk.CTkFrame):
             return
 
         self._model_menu.configure(values=models)
+        self._refresh_settings_model_menu(models)
         current = self._model_var.get()
         if current not in models:
             self._model_var.set(models[0])
@@ -370,6 +796,7 @@ class OllamaTab(ctk.CTkFrame):
     def _set_error(self, message: str):
         self._models = []
         self._model_menu.configure(values=[EMPTY_MODEL_TEXT])
+        self._refresh_settings_model_menu([EMPTY_MODEL_TEXT])
         self._model_var.set(EMPTY_MODEL_TEXT)
         self._model_name_var.set("")
         self._status_var.set("连接失败")
@@ -525,10 +952,11 @@ class OllamaTab(ctk.CTkFrame):
             border_width=0 if is_user else 1,
             border_color=S.LAYER_BORDER,
         )
+        side_pad = 28 if self._compact else 120
         bubble.pack(
             side="right" if is_user else "left",
             anchor="e" if is_user else "w",
-            padx=(120, 0) if is_user else (0, 120),
+            padx=(side_pad, 0) if is_user else (0, side_pad),
         )
 
         if is_user:
@@ -589,7 +1017,7 @@ class OllamaTab(ctk.CTkFrame):
             text=text,
             justify="left",
             anchor="w",
-            wraplength=620,
+            wraplength=300 if self._compact else 620,
             font=font or S.font_body(13),
             text_color=S.TEXT_ON_ACCENT if is_user else S.TEXT_PRIMARY,
         ).pack(fill="x", padx=S.SPACE_MD, pady=S.SPACE_SM)
@@ -635,7 +1063,7 @@ class OllamaTab(ctk.CTkFrame):
     def _insert_image(self, parent, source: str) -> bool:
         try:
             image = self._load_image(source)
-            image.thumbnail((520, 320), Image.LANCZOS)
+            image.thumbnail((300, 220) if self._compact else (520, 320), Image.LANCZOS)
             photo = ImageTk.PhotoImage(image)
             self._chat_images.append(photo)
             ctk.CTkLabel(parent, text="", image=photo).pack(
@@ -755,7 +1183,22 @@ class OllamaTab(ctk.CTkFrame):
         values = [self._endpoint_label(endpoint) for endpoint in self._filtered_endpoints()]
         if not values:
             values = ["暂无地址"]
-        self._endpoint_menu.configure(values=values)
+        if self._widget_exists(getattr(self, "_endpoint_menu", None)):
+            self._endpoint_menu.configure(values=values)
+
+    def _refresh_settings_model_menu(self, values: list[str] | None = None):
+        if values is None:
+            values = self._models or [EMPTY_MODEL_TEXT]
+        if self._widget_exists(getattr(self, "_settings_model_menu", None)):
+            self._settings_model_menu.configure(values=values)
+
+    def _widget_exists(self, widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _on_endpoint_selected(self, label: str):
         endpoint = self._endpoint_by_label(label)
@@ -768,6 +1211,7 @@ class OllamaTab(ctk.CTkFrame):
         self._on_save()
         self._models = []
         self._model_menu.configure(values=[EMPTY_MODEL_TEXT])
+        self._refresh_settings_model_menu([EMPTY_MODEL_TEXT])
         self._model_var.set(EMPTY_MODEL_TEXT)
         self._model_name_var.set("")
         self._render_history()
@@ -792,6 +1236,7 @@ class OllamaTab(ctk.CTkFrame):
         self._base_url.set("" if provider == PROVIDER_OTHER else DEFAULT_OLLAMA_URL)
         self._models = []
         self._model_menu.configure(values=[EMPTY_MODEL_TEXT])
+        self._refresh_settings_model_menu([EMPTY_MODEL_TEXT])
         self._model_var.set(EMPTY_MODEL_TEXT)
         self._model_name_var.set("")
         self._status_var.set("未连接")
