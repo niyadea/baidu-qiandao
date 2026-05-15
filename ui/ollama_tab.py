@@ -8,12 +8,13 @@ import json
 import re
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from urllib.parse import urlparse
 
 import customtkinter as ctk
 import requests
 from core.agent_actions import AgentActionRegistry, AgentIntent
+from core.knowledge_base import KnowledgeBaseManager, SUPPORTED_SUFFIXES
 from PIL import Image, ImageTk
 
 from . import styling as S
@@ -51,6 +52,10 @@ class OllamaTab(ctk.CTkFrame):
         self._on_save = on_save
         self._compact = compact
         self._action_registry = action_registry
+        self._kb_manager = KnowledgeBaseManager()
+        self._knowledge_bases: list[dict] = self._kb_manager.list_knowledge_bases()
+        self._kb_var = tk.StringVar(value="未启用")
+        self._kb_status_var = tk.StringVar(value="")
         self._models: list[str] = []
         self._histories: dict[str, list[dict[str, str]]] = {}
         self._chat_images: list[ImageTk.PhotoImage] = []
@@ -496,11 +501,7 @@ class OllamaTab(ctk.CTkFrame):
 
         self._build_agent_prompt_card(edit)
         self._build_agent_model_card(edit)
-        self._build_agent_placeholder_card(
-            edit,
-            "知识库",
-            "装配工艺知识库尚未接入。后续可在这里添加工艺文档、标准规范、工艺卡、设备说明和常见问题。",
-        )
+        self._build_knowledge_base_card(edit)
         self._build_agent_placeholder_card(
             edit,
             "工具",
@@ -726,6 +727,183 @@ class OllamaTab(ctk.CTkFrame):
             placeholder_text="可手动输入模型名",
         )
         self._model_entry.grid(row=7, column=1, sticky="ew", pady=(S.SPACE_SM, 0))
+
+    def _build_knowledge_base_card(self, parent):
+        card = SectionCard(parent, title="知识库")
+        card.pack(fill="x", padx=S.SPACE_SM, pady=S.SPACE_SM)
+        body = card.body
+        body.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            body,
+            text="当前知识库",
+            font=S.font_body(),
+            text_color=S.TEXT_SECONDARY,
+        ).grid(row=0, column=0, sticky="w", padx=(0, S.SPACE_SM))
+
+        self._kb_menu = ctk.CTkOptionMenu(
+            body,
+            variable=self._kb_var,
+            values=["未启用"],
+            command=self._on_kb_selected,
+            height=S.INPUT_HEIGHT,
+            corner_radius=S.RADIUS_INPUT,
+            fg_color=S.LAYER_ALT,
+            button_color=S.accent_pair(),
+            button_hover_color=S.accent_hover_pair(),
+            text_color=S.TEXT_PRIMARY,
+            font=S.font_body(),
+        )
+        self._kb_menu.grid(row=0, column=1, sticky="ew")
+
+        actions = ctk.CTkFrame(body, fg_color="transparent")
+        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(S.SPACE_SM, 0))
+        standard_button(
+            actions,
+            "新建知识库",
+            self._create_knowledge_base,
+            width=100,
+        ).pack(side="left", padx=(0, S.SPACE_SM))
+        accent_button(
+            actions,
+            "导入文档",
+            self._import_knowledge_file,
+            width=86,
+        ).pack(side="left", padx=(0, S.SPACE_SM))
+        standard_button(
+            actions,
+            "刷新",
+            self._refresh_knowledge_bases,
+            width=58,
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            body,
+            textvariable=self._kb_status_var,
+            font=S.font_body(),
+            text_color=S.TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(S.SPACE_SM, 0))
+
+        ctk.CTkLabel(
+            body,
+            text=(
+                "本地 SQLite 知识库保存在项目目录的 knowledge_base.sqlite3，"
+                "无需单独部署数据库服务。支持 txt/md/json/csv/log/py/docx。"
+            ),
+            font=S.font_body(),
+            text_color=S.TEXT_TERTIARY,
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(S.SPACE_SM, 0))
+
+        self._refresh_knowledge_bases()
+
+    def _refresh_knowledge_bases(self):
+        self._knowledge_bases = self._kb_manager.list_knowledge_bases()
+        values = ["未启用"] + [self._kb_label(item) for item in self._knowledge_bases]
+        if self._widget_exists(getattr(self, "_kb_menu", None)):
+            self._kb_menu.configure(values=values)
+        current_id = self._config_data.get("agent_kb_id")
+        current = self._kb_by_id(current_id)
+        if current is not None:
+            self._kb_var.set(self._kb_label(current))
+        else:
+            self._kb_var.set("未启用")
+            self._config_data["agent_kb_id"] = None
+        self._refresh_kb_status()
+
+    def _create_knowledge_base(self):
+        name = simpledialog.askstring(
+            "新建知识库",
+            "请输入知识库名称，例如：装配工艺知识库",
+            parent=self.winfo_toplevel(),
+        )
+        if not name:
+            return
+        try:
+            kb_id = self._kb_manager.create_knowledge_base(name)
+        except Exception as e:
+            messagebox.showerror("新建失败", f"{type(e).__name__}: {e}")
+            return
+        self._config_data["agent_kb_id"] = kb_id
+        self._on_save()
+        self._refresh_knowledge_bases()
+
+    def _import_knowledge_file(self):
+        kb_id = self._current_kb_id()
+        if kb_id is None:
+            messagebox.showwarning("提示", "请先新建或选择一个知识库")
+            return
+        suffixes = " ".join(f"*{suffix}" for suffix in sorted(SUPPORTED_SUFFIXES))
+        path = filedialog.askopenfilename(
+            title="选择要导入知识库的文档",
+            filetypes=[
+                ("支持的文档", suffixes),
+                ("所有文件", "*.*"),
+            ],
+            parent=self.winfo_toplevel(),
+        )
+        if not path:
+            return
+        try:
+            result = self._kb_manager.import_file(kb_id, path)
+        except Exception as e:
+            messagebox.showerror("导入失败", f"{type(e).__name__}: {e}")
+            return
+        self._refresh_knowledge_bases()
+        self._kb_status_var.set(
+            f"已导入 {result['title']}，切分 {result['chunk_count']} 个片段。"
+        )
+
+    def _on_kb_selected(self, label: str):
+        if label == "未启用":
+            self._config_data["agent_kb_id"] = None
+        else:
+            kb = self._kb_by_label(label)
+            self._config_data["agent_kb_id"] = kb["id"] if kb else None
+        self._on_save()
+        self._refresh_kb_status()
+
+    def _current_kb_id(self) -> int | None:
+        value = self._config_data.get("agent_kb_id")
+        try:
+            kb_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        return kb_id if self._kb_by_id(kb_id) else None
+
+    def _kb_by_id(self, kb_id) -> dict | None:
+        try:
+            target = int(kb_id)
+        except (TypeError, ValueError):
+            return None
+        for item in self._knowledge_bases:
+            if int(item["id"]) == target:
+                return item
+        return None
+
+    def _kb_by_label(self, label: str) -> dict | None:
+        for item in self._knowledge_bases:
+            if self._kb_label(item) == label:
+                return item
+        return None
+
+    def _kb_label(self, item: dict) -> str:
+        return f"{item['name']} ({item.get('document_count', 0)} 文档)"
+
+    def _refresh_kb_status(self):
+        kb = self._kb_by_id(self._config_data.get("agent_kb_id"))
+        if kb is None:
+            self._kb_status_var.set("未启用知识库，Agent 将只使用模型自身知识和工具结果。")
+            return
+        self._kb_status_var.set(
+            f"已启用：{kb['name']}；文档 {kb.get('document_count', 0)} 个，"
+            f"片段 {kb.get('chunk_count', 0)} 个。"
+        )
 
     def _build_agent_placeholder_card(self, parent, title: str, message: str):
         card = SectionCard(parent, title=title)
@@ -970,14 +1148,37 @@ class OllamaTab(ctk.CTkFrame):
         )
 
     def _agent_user_prompt(self, content: str, tool_results: list[dict[str, str]]) -> str:
+        kb_context = self._knowledge_context(content)
         if not tool_results:
-            return f"用户请求：{content}"
+            return (
+                f"用户请求：{content}\n"
+                f"{kb_context}"
+            ).strip()
         return (
             f"用户请求：{content}\n"
+            f"{kb_context}\n"
             "已执行工具结果：\n"
             f"{json.dumps(tool_results, ensure_ascii=False, indent=2)}\n"
             "请根据工具结果继续决定是否还要调用工具；如果任务已完成，返回 answer。"
         )
+
+    def _knowledge_context(self, query: str) -> str:
+        kb_id = self._current_kb_id()
+        if kb_id is None:
+            return ""
+        try:
+            results = self._kb_manager.search(kb_id, query, limit=4)
+        except Exception as e:
+            return f"知识库检索失败：{type(e).__name__}: {e}"
+        if not results:
+            return "知识库检索结果：未命中相关片段。"
+        lines = ["知识库检索结果："]
+        for idx, item in enumerate(results, 1):
+            content = re.sub(r"\s+", " ", item.get("content", "")).strip()
+            if len(content) > 420:
+                content = content[:420] + "..."
+            lines.append(f"[{idx}] 来源：{item.get('title', '未知文档')}\n{content}")
+        return "\n".join(lines)
 
     def _plain_chat_once(self, model: str, messages: list[dict[str, str]]) -> str:
         if self._provider_var.get() == PROVIDER_OLLAMA:

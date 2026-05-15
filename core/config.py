@@ -39,6 +39,8 @@ DEFAULT_CONFIG = {
     ],
     "ollama_current_endpoint": "http://localhost:11434",
     "ollama_send_shortcut": "enter",
+    "agent_kb_id": None,
+    "agent_prompt": "",
 }
 
 
