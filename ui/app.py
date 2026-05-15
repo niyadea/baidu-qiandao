@@ -20,6 +20,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 import requests
 
+from core.agent_actions import AgentActionRegistry
 from core import (
     CONFIG_FILE,
     DEFAULT_CONFIG,
@@ -179,7 +180,23 @@ class App(ctk.CTk):
         )
         self._ticket_tab.pack(fill="both", expand=True)
 
+        self._agent_actions = self._build_agent_actions()
         self._build_agent_drawer()
+
+    def _build_agent_actions(self) -> AgentActionRegistry:
+        registry = AgentActionRegistry()
+        registry.register("app.status", "读取当前页面和任务状态", self._agent_status)
+        registry.register("app.switch_tab", "切换到贴吧、12306 或大麦页面", self._agent_switch_tab)
+        registry.register("tieba.sign_all", "执行贴吧一键签到", self._agent_tieba_sign_all)
+        registry.register("tieba.sign_normal", "执行贴吧逐个签到", self._agent_tieba_sign_normal)
+        registry.register("tieba.stop", "停止当前贴吧签到任务", self._agent_tieba_stop)
+        registry.register("ticket.query", "开始 12306 余票查询", self._agent_ticket_start)
+        registry.register("ticket.start_polling", "开始 12306 余票轮询", self._agent_ticket_start)
+        registry.register("ticket.stop_polling", "停止 12306 余票轮询", self._agent_ticket_stop)
+        registry.register("damai.query_stock", "开始大麦库存查询", self._agent_damai_start)
+        registry.register("damai.start_polling", "开始大麦库存轮询", self._agent_damai_start)
+        registry.register("damai.stop_polling", "停止大麦库存轮询", self._agent_damai_stop)
+        return registry
 
     def _build_agent_drawer(self):
         self._agent_drawer = ctk.CTkFrame(
@@ -217,6 +234,7 @@ class App(ctk.CTk):
             config_data=self.config_data,
             on_save=lambda: save_config(self.config_data),
             compact=True,
+            action_registry=self._agent_actions,
         )
         self._ollama_tab.pack(fill="both", expand=True)
 
@@ -233,6 +251,138 @@ class App(ctk.CTk):
         else:
             self._agent_drawer.pack_forget()
             self._agent_btn.configure(text="Agent")
+
+    # ── Agent 动作 ───────────────────────────────────────
+
+    def _agent_status(self, _params: dict) -> str:
+        current = self._tabview.get() or "未知"
+        ticket_tab = self._ticket_tab._nb.get()
+        sign_state = "运行中" if self._signing else "未运行"
+        train_state = self._ticket_tab._12306_status.get()
+        damai_state = self._ticket_tab._damai_status.get()
+        return (
+            f"当前主页面: {current}\n"
+            f"当前抢票子页面: {ticket_tab}\n"
+            f"贴吧签到: {sign_state}\n"
+            f"12306 查票: {train_state}\n"
+            f"大麦查票: {damai_state}"
+        )
+
+    def _agent_switch_tab(self, params: dict) -> str:
+        tab = str(params.get("tab", "")).lower()
+        if tab in {"tieba", "贴吧", "贴吧签到"}:
+            self._tabview.set("贴吧签到")
+            return "已切换到贴吧签到页面。"
+        if tab in {"ticket", "抢票", "票务"}:
+            self._tabview.set("抢票 (12306 / 大麦)")
+            return "已切换到抢票页面。"
+        if tab in {"12306", "train", "火车票"}:
+            self._tabview.set("抢票 (12306 / 大麦)")
+            self._ticket_tab._nb.set("12306 火车票")
+            return "已切换到 12306 火车票页面。"
+        if tab in {"damai", "大麦", "大麦网"}:
+            self._tabview.set("抢票 (12306 / 大麦)")
+            self._ticket_tab._nb.set("大麦网")
+            return "已切换到大麦网页面。"
+        return "没有识别要切换的页面，可用页面: tieba、ticket、12306、damai。"
+
+    def _agent_tieba_sign_all(self, _params: dict) -> str:
+        if self._signing:
+            return "贴吧签到任务已经在运行。"
+        if not self._bduss_var.get().strip():
+            return "无法执行一键签到：请先在贴吧签到页面填写 BDUSS。"
+        self._tabview.set("贴吧签到")
+        self._on_onekey()
+        return "已开始贴吧一键签到，执行进度会显示在贴吧签到日志中。"
+
+    def _agent_tieba_sign_normal(self, _params: dict) -> str:
+        if self._signing:
+            return "贴吧签到任务已经在运行。"
+        if not self._bduss_var.get().strip():
+            return "无法执行逐个签到：请先在贴吧签到页面填写 BDUSS。"
+        self._tabview.set("贴吧签到")
+        self._on_sign()
+        return "已开始贴吧逐个签到，执行进度会显示在贴吧签到日志中。"
+
+    def _agent_tieba_stop(self, _params: dict) -> str:
+        if not self._signing:
+            return "当前没有正在运行的贴吧签到任务。"
+        self._on_stop()
+        return "已请求停止贴吧签到任务。"
+
+    def _agent_ticket_start(self, params: dict) -> str:
+        tab = self._ticket_tab
+        self._tabview.set("抢票 (12306 / 大麦)")
+        tab._nb.set("12306 火车票")
+        if tab._12306_worker.is_running():
+            return "12306 查票任务已经在运行。"
+        if tab._12306_auto_order.get():
+            return "为避免误操作，Agent 暂不启动已开启自动下单的 12306 任务。请先关闭自动下单后再试。"
+
+        if params.get("from"):
+            tab._12306_from.set(str(params["from"]))
+        if params.get("to"):
+            tab._12306_to.set(str(params["to"]))
+        if params.get("date"):
+            tab._12306_date.set(str(params["date"]))
+        if params.get("seat"):
+            tab._12306_seat.set(str(params["seat"]))
+
+        missing = []
+        if not tab._12306_cookie.get().strip():
+            missing.append("Cookie")
+        if not tab._12306_from.get().strip():
+            missing.append("出发站")
+        if not tab._12306_to.get().strip():
+            missing.append("到达站")
+        if not tab._12306_date.get().strip():
+            missing.append("出发日期")
+        if missing:
+            return "无法开始 12306 查票：请先填写 " + " / ".join(missing) + "。"
+
+        tab._on_12306_start()
+        return (
+            "已开始 12306 查票："
+            f"{tab._12306_from.get()} → {tab._12306_to.get()} "
+            f"{tab._12306_date.get()}，席别 {tab._12306_seat.get()}。"
+        )
+
+    def _agent_ticket_stop(self, _params: dict) -> str:
+        self._tabview.set("抢票 (12306 / 大麦)")
+        self._ticket_tab._nb.set("12306 火车票")
+        if not self._ticket_tab._12306_worker.is_running():
+            return "当前没有正在运行的 12306 查票任务。"
+        self._ticket_tab._on_12306_stop()
+        return "已请求停止 12306 查票任务。"
+
+    def _agent_damai_start(self, params: dict) -> str:
+        tab = self._ticket_tab
+        self._tabview.set("抢票 (12306 / 大麦)")
+        tab._nb.set("大麦网")
+        if tab._damai_worker.is_running():
+            return "大麦查票任务已经在运行。"
+
+        if params.get("url_or_id"):
+            tab._damai_url.set(str(params["url_or_id"]))
+
+        missing = []
+        if not tab._damai_cookie.get().strip():
+            missing.append("Cookie")
+        if not tab._damai_url.get().strip():
+            missing.append("演出 URL/ID")
+        if missing:
+            return "无法开始大麦库存查询：请先填写 " + " / ".join(missing) + "。"
+
+        tab._on_damai_start()
+        return f"已开始大麦库存查询：{tab._damai_url.get()}。"
+
+    def _agent_damai_stop(self, _params: dict) -> str:
+        self._tabview.set("抢票 (12306 / 大麦)")
+        self._ticket_tab._nb.set("大麦网")
+        if not self._ticket_tab._damai_worker.is_running():
+            return "当前没有正在运行的大麦查票任务。"
+        self._ticket_tab._on_damai_stop()
+        return "已请求停止大麦查票任务。"
 
     def _build_tieba_tab(self, parent):
         pad = {"padx": S.SPACE_MD, "pady": S.SPACE_SM}

@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 import customtkinter as ctk
 import requests
+from core.agent_actions import AgentActionRegistry, AgentIntent
 from PIL import Image, ImageTk
 
 from . import styling as S
@@ -36,11 +37,20 @@ IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 class OllamaTab(ctk.CTkFrame):
     """A small Ollama client that can switch between multiple API endpoints."""
 
-    def __init__(self, parent, *, config_data: dict, on_save, compact: bool = False):
+    def __init__(
+        self,
+        parent,
+        *,
+        config_data: dict,
+        on_save,
+        compact: bool = False,
+        action_registry: AgentActionRegistry | None = None,
+    ):
         super().__init__(parent, fg_color="transparent")
         self._config_data = config_data
         self._on_save = on_save
         self._compact = compact
+        self._action_registry = action_registry
         self._models: list[str] = []
         self._histories: dict[str, list[dict[str, str]]] = {}
         self._chat_images: list[ImageTk.PhotoImage] = []
@@ -494,7 +504,7 @@ class OllamaTab(ctk.CTkFrame):
         self._build_agent_placeholder_card(
             edit,
             "工具",
-            "后续可把贴吧签到、余票查询、开始轮询、停止任务等能力注册为 Agent 可调用工具。",
+            self._agent_tools_text(),
         )
 
         ctk.CTkLabel(
@@ -730,6 +740,16 @@ class OllamaTab(ctk.CTkFrame):
             wraplength=420,
         ).pack(fill="x")
 
+    def _agent_tools_text(self) -> str:
+        if self._action_registry is None:
+            return "当前未接入 Agent 可调用工具。"
+        actions = self._action_registry.list_actions()
+        if not actions:
+            return "当前未注册 Agent 可调用工具。"
+        lines = ["已启用工具："]
+        lines.extend(f"- {action.name}: {action.description}" for action in actions)
+        return "\n".join(lines)
+
     def refresh_models(self):
         self._save_current_endpoint_selection()
         self._refresh_btn.configure(state="disabled")
@@ -810,13 +830,20 @@ class OllamaTab(ctk.CTkFrame):
         if self._sending:
             return
         self._save_current_endpoint_selection()
+        content = self._input.get("1.0", "end").strip()
+        if not content:
+            return
+
+        if self._try_agent_action(content):
+            return
+
         model = self._current_model_name()
         if not model or model in {EMPTY_MODEL_TEXT, NO_MODEL_TEXT}:
             messagebox.showwarning("提示", "请先刷新并选择一个模型")
             return
 
-        content = self._input.get("1.0", "end").strip()
-        if not content:
+        if self._action_registry is not None:
+            self._start_model_agent_turn(content, model)
             return
 
         self._input.delete("1.0", "end")
@@ -847,6 +874,168 @@ class OllamaTab(ctk.CTkFrame):
                 self._ui(self._set_sending, False)
 
         threading.Thread(target=_work, daemon=True).start()
+
+    def _try_agent_action(self, content: str) -> bool:
+        if self._action_registry is None:
+            return False
+        intent = self._action_registry.parse_intent(content)
+        if intent is None:
+            return False
+
+        self._input.delete("1.0", "end")
+        self._append_local_exchange(content, "执行中...")
+        history_key = self._local_history_key()
+
+        try:
+            result = self._action_registry.execute(intent)
+        except Exception as e:
+            result = f"[执行失败] {type(e).__name__}: {e}"
+        self._replace_answer(history_key, result)
+        return True
+
+    def _start_model_agent_turn(self, content: str, model: str):
+        self._input.delete("1.0", "end")
+        history_key = self._history_key(model)
+        history = self._histories.setdefault(history_key, [])
+        history.append({"role": "user", "content": content})
+        history.append({"role": "assistant", "content": "思考中..."})
+        self._render_history()
+        self._set_sending(True)
+
+        def _work():
+            try:
+                answer = self._run_model_agent_loop(model, content)
+                if not answer:
+                    answer = "(模型没有返回内容)"
+                self._ui(self._replace_answer, history_key, answer)
+            except Exception as e:
+                self._ui(
+                    self._replace_answer,
+                    history_key,
+                    f"[请求失败] {type(e).__name__}: {e}",
+                )
+            finally:
+                self._ui(self._set_sending, False)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _run_model_agent_loop(self, model: str, content: str) -> str:
+        if self._action_registry is None:
+            return self._plain_chat_once(model, [{"role": "user", "content": content}])
+
+        tool_results: list[dict[str, str]] = []
+        for _step in range(3):
+            messages = [
+                {"role": "system", "content": self._agent_system_prompt()},
+                {"role": "user", "content": self._agent_user_prompt(content, tool_results)},
+            ]
+            raw = self._plain_chat_once(model, messages).strip()
+            plan = self._action_registry.parse_tool_plan(raw)
+            if plan is None:
+                return raw
+            calls = plan.get("tool_calls") or []
+            if not calls:
+                return str(plan.get("answer") or "").strip()
+
+            for call in calls[:3]:
+                intent = AgentIntent(
+                    action=str(call.get("action", "")).strip(),
+                    params=call.get("params", {}) if isinstance(call.get("params"), dict) else {},
+                )
+                result = self._execute_agent_intent_threadsafe(intent)
+                tool_results.append(
+                    {
+                        "action": intent.action,
+                        "params": json.dumps(intent.params, ensure_ascii=False),
+                        "result": result,
+                    }
+                )
+
+        return self._format_tool_results(tool_results)
+
+    def _agent_system_prompt(self) -> str:
+        tools = []
+        if self._action_registry is not None:
+            for action in self._action_registry.list_actions():
+                tools.append({"name": action.name, "description": action.description})
+        return (
+            "你是这个桌面应用内的 Agent。你可以回答问题，也可以调用工具操作应用。\n"
+            "必须只返回一个 JSON 对象，不能使用 Markdown，不能输出 JSON 之外的文字。\n"
+            "如果需要调用工具，返回："
+            "{\"tool_calls\":[{\"action\":\"工具名\",\"params\":{}}]}。\n"
+            "如果不需要调用工具，返回：{\"answer\":\"你的回答\"}。\n"
+            "如果工具结果已经足够回答用户，返回 answer 总结结果。\n"
+            "高风险动作不要调用，缺少参数时直接 answer 说明缺什么。\n"
+            f"可用工具：{json.dumps(tools, ensure_ascii=False)}"
+        )
+
+    def _agent_user_prompt(self, content: str, tool_results: list[dict[str, str]]) -> str:
+        if not tool_results:
+            return f"用户请求：{content}"
+        return (
+            f"用户请求：{content}\n"
+            "已执行工具结果：\n"
+            f"{json.dumps(tool_results, ensure_ascii=False, indent=2)}\n"
+            "请根据工具结果继续决定是否还要调用工具；如果任务已完成，返回 answer。"
+        )
+
+    def _plain_chat_once(self, model: str, messages: list[dict[str, str]]) -> str:
+        if self._provider_var.get() == PROVIDER_OLLAMA:
+            return self._chat_ollama_once(model, messages)
+        return self._chat_openai(model, messages)
+
+    def _chat_ollama_once(self, model: str, messages: list[dict[str, str]]) -> str:
+        resp = requests.post(
+            self._url("/api/chat"),
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": False,
+            },
+            timeout=(10, 300),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("message", {}).get("content", "").strip()
+
+    def _execute_agent_intent_threadsafe(self, intent: AgentIntent) -> str:
+        if self._action_registry is None:
+            return "当前未接入 Agent 工具。"
+        done = threading.Event()
+        result_box: dict[str, str] = {}
+
+        def _run():
+            try:
+                result_box["result"] = self._action_registry.execute(intent)
+            except Exception as e:
+                result_box["result"] = f"[执行失败] {type(e).__name__}: {e}"
+            finally:
+                done.set()
+
+        self.after(0, _run)
+        done.wait(30)
+        return result_box.get("result", "工具执行超时。")
+
+    def _format_tool_results(self, results: list[dict[str, str]]) -> str:
+        if not results:
+            return "未执行任何工具。"
+        lines = ["已执行工具："]
+        for item in results:
+            lines.append(f"- {item['action']}: {item['result']}")
+        return "\n".join(lines)
+
+    def _append_local_exchange(self, content: str, answer: str):
+        history_key = self._local_history_key()
+        history = self._histories.setdefault(history_key, [])
+        history.append({"role": "user", "content": content})
+        history.append({"role": "assistant", "content": answer})
+        self._render_history()
+
+    def _local_history_key(self) -> str:
+        model = self._current_model_name()
+        if not model or model in {EMPTY_MODEL_TEXT, NO_MODEL_TEXT}:
+            model = "Agent"
+        return self._history_key(model)
 
     def _chat_ollama(
         self,
@@ -901,17 +1090,17 @@ class OllamaTab(ctk.CTkFrame):
             history[-1]["content"] = answer
         else:
             history.append({"role": "assistant", "content": answer})
-        if self._history_key(self._current_model_name()) == history_key:
+        if self._history_key(self._history_model_name()) == history_key:
             self._render_history()
 
     def _clear_current_chat(self):
-        model = self._current_model_name()
+        model = self._history_model_name()
         if model:
             self._histories[self._history_key(model)] = []
         self._render_history()
 
     def _render_history(self):
-        model = self._current_model_name()
+        model = self._history_model_name()
         history = self._histories.get(self._history_key(model), [])
         if not history:
             self._render_text("选择地址和模型后即可开始对话。Ctrl+Enter 也可以发送。")
@@ -1137,6 +1326,12 @@ class OllamaTab(ctk.CTkFrame):
         if typed:
             return typed
         return self._model_var.get().strip()
+
+    def _history_model_name(self) -> str:
+        model = self._current_model_name()
+        if not model or model in {EMPTY_MODEL_TEXT, NO_MODEL_TEXT}:
+            return "Agent"
+        return model
 
     def _ensure_endpoint_config(self):
         endpoints = self._config_data.get("ollama_endpoints")
